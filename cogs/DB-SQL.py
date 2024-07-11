@@ -369,10 +369,11 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
         #logger.info(message)
         await self.message(message=message)
 
-    @commands.Cog.listener('on_STT_event')
+    @commands.Cog.listener('on_STT_event_HC_pass')
     async def on_STT_event(self, message: Discord_Message):
-        self.message_waiting_for_token_count.append(message)
-        self.bot.dispatch('token_count_request', message = message)
+        if message.tokens == 0:
+            self.message_waiting_for_token_count.append(message)
+            self.bot.dispatch('token_count_request', message = message)
 
     @commands.Cog.listener('on_tokens_counted')
     async def on_tokens_counted(self, message: Discord_Message):

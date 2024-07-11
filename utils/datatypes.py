@@ -11,12 +11,20 @@ class Discord_Message:
     tokens: int = 0
     sentences: list[str] = None
     message_id: int = None
+    timestamp_Audio_Start: float = None
+    timestamp_Audio_End: float = None
+    timestamp_STT: float = None
+    timestamp_LLM: float = None
+    timestamp_TTS: float = None
+    reponse_message_id: int = None
 
 @dataclass
 class Piper_TTS:
     text: str
     model: str
     voice: str
+    timestamp_request_start: float = None
+    timestamp_request_end: float = None
 #    host: str # future plans: multiple servers to avoid loading lag for voice models
 #    port: int
 
@@ -36,6 +44,9 @@ class Bot_Character:
     personality: str
     likes: str
     dislikes: str
+
+Halluicanation_Sentences = ('Thank you.', 'Bye-bye.', 'Thanks for watching!', 
+    'Thank you for watching.', "I'll see you next time.", '  Thank you so much for watching.')
 
 @dataclass
 class LLM_Prompts:

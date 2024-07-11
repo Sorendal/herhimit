@@ -22,8 +22,9 @@ events dispatched
         audio_data: filelike object containing the audio data
 '''
 
-import logging, array, io#, wave
+import logging, array, io, time#, wave
 from collections import deque
+from dataclasses import dataclass
 from typing import Deque
 
 import numpy as np
@@ -40,6 +41,11 @@ from utils.datatypes import Piper_TTS
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class Piper_Output:
+    audio: io.BytesIO
+    message: Piper_TTS
+
 class Piper():
     def __init__(self) -> None:
         self.piper_host:str = None
@@ -55,7 +61,7 @@ class Piper():
         self.resampled_audio = None
         self.processing_requests = False
 
-    async def process_request(self, message: Piper_TTS, voice: wyTTS.SynthesizeVoice) -> io.BytesIO:
+    async def process_request(self, message: Piper_TTS, voice: wyTTS.SynthesizeVoice) -> Piper_Output:
 
         my_client = wyClient.AsyncTcpClient(host=self.piper_host, port=self.piper_port)
         await my_client.connect()
@@ -99,14 +105,14 @@ class Piper():
         #    wave_file.setsampwidth(self.output_size)
         #    wave_file.writeframesraw(resampled_audio_np_stereo)
 
-        return self.resampled_audio
+        return Piper_Output(message=message, audio=self.resampled_audio)
 
 class TTS_Piper(commands.Cog, Piper):
 
     def __init__(self, bot:commands.Bot) -> None:
         Piper.__init__(self)
         self.bot = bot
-        self.incoming_requests: Deque[Piper_TTS] = deque()
+        self.incoming_requests: Deque[Piper_TTS, wyTTS.SynthesizeVoice] = deque()
         self.processing_requests = False
         self.setconfig()
 
@@ -124,13 +130,16 @@ class TTS_Piper(commands.Cog, Piper):
         while len(self.incoming_requests) > 0:
             logger.debug(f'processing TTS request {self.incoming_requests[0]}')
             message, wyTTSVoice = self.incoming_requests.popleft()
-            await self.process_request(message = message, voice=wyTTSVoice)
-            self.bot.dispatch(f'TTS_play', self.resampled_audio)
-            logger.debug(f'processed TTS request {message}')
+            output = await self.process_request(message = message, voice=wyTTSVoice)
+            output.message.timestamp_request_end = time.perf_counter()
+            self.bot.dispatch(f'TTS_play', audio=output.audio, message=output.message)
+            if output.message.timestamp_request_end != None:
+                if output.message.timestamp_request_start != None:
+                    logger.info(f'TTS request processed {(output.message.timestamp_request_end - output.message.timestamp_request_start):.3f}')
 
     @tts_monitor.after_loop
     async def tts_monitor_after_loop(self):
-        logger.debug(f'TTS monitor stopping')
+        logger.debug(f'TTS monitor uping')
         pass
 
     @tts_monitor.before_loop
@@ -139,8 +148,8 @@ class TTS_Piper(commands.Cog, Piper):
         pass
 
     @commands.Cog.listener('on_TTS_event')
-    async def on_TTS_event(self, message: Piper_TTS) -> None:
-        logger.debug(f'on TTS_event received {message}')
+    async def on_TTS_event(self, message: Piper_TTS):
+        logger.debug(f'on TTS_event received')
         wyTTSVoice = wyTTS.SynthesizeVoice(name=message.model, speaker=message.voice)
         self.incoming_requests.append((message, wyTTSVoice))
         if not self.tts_monitor.is_running():

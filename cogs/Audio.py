@@ -100,12 +100,12 @@ MemberOrUser = Union[discord.Member, discord.User]
 class StreamData(TypedDict):
     buffer: array.array = array.array('B')#[int]
     last_time: time = None
-    start_time: time = None
     ssrc: int = None
     member: str = None
     member_id: int = None
     iterrupt_sent: bool = False
     last_sequence: int = None
+    start_time: float = None
 
 class Speech_To_Text_Sink(voice_recv.AudioSink):
     def __init__(self,
@@ -153,7 +153,7 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             logger.debug('STT Audio Buffer empty')
             return
                     
-        current_time = time.time()
+        current_time = time.perf_counter()
         for key in self.audio_buffer_dict.keys():
             sdata = self.audio_buffer_dict[key]
             if sdata['last_time'] == None:
@@ -168,7 +168,9 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
                             member = sdata['member'],
                             member_id = sdata['member_id'],
                             listeners= self.listeners.keys(),
-                            listener_names= self.listeners.values()
+                            listener_names= self.listeners.values(),
+                            timestamp_Audio_Start=sdata['start_time'],
+                            timestamp_Audio_End=current_time,
                         )
                     self.bot.dispatch('speaker_event', 
                             message = speaker_event_message, 
@@ -184,7 +186,10 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             elif (time_diff > self.interrupt_time) and (len(sdata['buffer']) < self.min_buffer_length):
                 logger.debug(f'speaker_interrupt_clear sent')
                 sdata['last_time'] = None
-                self.bot.dispatch(f'speaker_interrupt_clear', member_id = sdata['member_id'])
+                self.bot.dispatch(f'speaker_interrupt_clear', message = 
+                    Speaking_Interrupt(num_sentences=None, 
+                            member_id=sdata['member_id'], 
+                            member_name=sdata['member']))
 
     @monitor.before_loop
     async def before(self):
@@ -192,7 +197,7 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
 
     @monitor.after_loop
     async def after(self):
-        logger.info('stt monitor stopped')
+        logger.debug('stt monitor stopped')
 
     def _drop(self, user_id: int) -> None:
         if user_id in self.audio_buffer_dict:
@@ -227,7 +232,7 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             sdata['ssrc'] = data.source.id
             sdata['member_id'] = user.id
             sdata['iterrupt_sent'] = False
-            sdata['start_time'] = time.time()
+            sdata['start_time'] = time.perf_counter()
             sdata['last_sequence'] = data.packet.sequence
 
         #logger.info(f'{data.packet.sequence}')
@@ -237,20 +242,20 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             sdata['buffer'].extend([0] * missing_packets * self.audio_packet_lenght)
 
         sdata['buffer'].extend(data.pcm)
-        sdata['last_time'] = time.time()
+        sdata['last_time'] = time.perf_counter()
         sdata['last_sequence'] = data.packet.sequence
         
         # send an event to stop bot voice playback when someone speaks in
         # the channel
         if (sdata['iterrupt_sent'] == False) and (len(self.play_queue) > 0):
-            if (time.time() - sdata['start_time']) > self.interrupt_time:
+            if (time.perf_counter() - sdata['start_time']) > self.interrupt_time:
                 int_message = Speaking_Interrupt( 
                         num_sentences=len(self.play_queue),
                         member_id = sdata['member_id'],
                         member_name = sdata['member'])
 
                 self.bot.dispatch('speaker_interrupt', message = int_message)
-                logger.debug(f'speaker_interrupt send {int_message}')
+                logger.debug(f'speaker_interrupt sent {int_message}')
                 
                 if self.voice_client.is_playing():
                     self.voice_client.pause()
@@ -260,10 +265,10 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
         logger.debug(f'stt sink write {user}')
 
     def cleanup(self, *args, **kwargs) -> None:
-        logger.info(f'communications cleanup {args} {kwargs}')
+        logger.debug(f'communications cleanup')
+        self.play_queue.clear()
         if self.voice_client.is_playing():
             self.voice_client.pause()
-            self.play_queue.clear()
         if len(kwargs.keys()) > 0:
             for user_id in tuple(self.audio_buffer_dict.keys()):
                 self._drop(user_id)
@@ -294,6 +299,7 @@ class Audio_Cog(commands.Cog):
         #await self._connect_text()
         await asyncio.sleep(5)
         await self._connect_voice()
+        logger.info(f'voice_client_connected {self.voice_client.supported_modes}')
 
     @commands.Cog.listener('on_speaker_event')
     async def on_speaker_event(self, **kwargs) -> None:
@@ -327,7 +333,7 @@ class Audio_Cog(commands.Cog):
         self.voice_client.listen(self.stt_sink)
             
     @commands.Cog.listener('on_TTS_play')
-    async def on_TTS_play(self, audio:io.BytesIO):
+    async def on_TTS_play(self, audio:io.BytesIO, **kwargs):
         logger.debug('on TTS play received')
         self.play_queue.append(audio)
 

@@ -27,16 +27,18 @@ Events Dispatched
 
 Events Listeners
 
-    on_STT_event: sends a message to the text channel with the member name and the text.
+    on_STT_event_HC_pass: sends a message to the text channel with the member name and the text.
         This is so the users can see what the STT module output is not corrext (the word error
         rate is above 5%)
 
     on_LLM_message - sends  a message to the text channel and stores the id of that 
         message in self.last_bot_message_id
 
-    on_interrupted_message - edits the last LLM message to strikethough the interrupted 
-        text. This is so the users in the channel can understand if the LLM gives attitude 
-        for being interrupted.
+    on_update_message - edits the last message sent by a user or bot with the new text. 
+        For a bot message, this is to show interrupts with a strike through.
+        For user messages, this is to show if they have a speaking pause 
+
+    on_delete_message - deletes the last message sent by the bot.
 
     on_ready - logs an info message
 
@@ -49,7 +51,12 @@ Commands
 
     die - calls cleanup in all cogs and then exits
 
-    callme - sets name for llm (Bob instead of SuperSexyBob)
+    callme - sets name for llm (Bob instead of SuperSexyBob) - not implimented
+
+    unload - unloads a cog, use 3 letters instead of the full cog name
+
+    load - loads a cog (not implimented, broken code)
+
 
 Configuration
 
@@ -76,7 +83,7 @@ from dotenv import dotenv_values
 import discord
 from discord.ext import commands
 
-from utils.datatypes import Discord_Message
+from utils.datatypes import Discord_Message, Halluicanation_Sentences
 
 config = dotenv_values('.env')
 
@@ -96,7 +103,7 @@ class TextInterface(commands.Cog):
         self.track_interrupt = bool(self.bot.config['behavior_track_text_interrupt'])
         self.text_channel: discord.TextChannel = None
         self.authorized_roles: dict[int, str] = {}
-        self.last_bot_message_id: int = None
+        self.last_message: dict[int, int] = {}
 
     async def _connect_text(self):
         if self.text_channel == None:
@@ -231,9 +238,10 @@ class TextInterface(commands.Cog):
             self.bot.dispatch('update_username', name=name)
             await ctx.send('I will call you ' + name)
     
-    @commands.Cog.listener('on_STT_event')
-    async def on_STT_event(self, message: Discord_Message):
-        await self.text_channel.send(f':{message.member.capitalize()}: {message.text}')
+    @commands.Cog.listener('on_STT_event_HC_passed')
+    async def on_STT_event_HC_passed(self, message: Discord_Message, *args, **kwargs):
+        sent_message = await self.text_channel.send(f':{message.member.capitalize()}: {message.text}')
+        self.last_message[message.member_id] = (sent_message.id + 1 - 1)
 
     @commands.Cog.listener('on_LLM_message')
     async def on_LLM_message(self, message: Discord_Message):
@@ -241,14 +249,20 @@ class TextInterface(commands.Cog):
         create a new message and store the message id in self.last_bot_message_id
         '''
         sent_message = await self.text_channel.send(message.text) 
-        self.last_bot_message_id = sent_message.id
+        self.last_message[message.member_id] = (sent_message.id + 1 - 1)
 
-    @commands.Cog.listener('on_interrupted_message')
-    async def on_interrupted_message(self, message: Discord_Message):
+    @commands.Cog.listener('on_update_message')
+    async def on_update_message(self, message: Discord_Message):
         if self.track_interrupt == False:
             return
-        channel_message = await self.text_channel.fetch_message(self.last_bot_message_id)
+        channel_message = await self.text_channel.fetch_message(self.last_message[message.member_id])
         await channel_message.edit(content=message.text)
+        logging.info(f'Message updated')
+
+    @commands.Cog.listener('on_delete_message')
+    async def on_interrupted_message(self, message: Discord_Message):
+        await self.text_channel.delete_messages(self.last_message[message.member_id])
+
 
 @bot.event
 async def on_ready():
@@ -264,7 +278,7 @@ async def load_cogs():
 
 bot.config = config
 
-async def main():
+async def main():   
     
     await load_cogs()
     
