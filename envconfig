@@ -1,0 +1,34 @@
+client_token=
+client_text_channel=
+
+com_voice_channel=
+com_min_audio_len=500
+com_end_speaking_delay=200
+com_interrupt_time=100
+
+STT_WFW_host=
+STT_WFW_port=
+
+TTS_piper_host=
+TTS_piper_port=
+TTS_piper_model='en_US-lessac-medium.onnx'
+TTS_piper_speaker=0
+
+LLM_host=
+LLM_port=
+LLM_model=
+LLM_api_key=
+LLM_context_length=32768
+LLM_server_type='ollama'
+LLM_SFW=0
+
+sql_db_type = 'mariadb'
+sql_db_sqlite_file = './discord.db'
+sql_db_host = 'pd'
+sql_db_port = 3306
+sql_db_user = 'DiscordBot'
+sql_db_password = 
+sql_db_database = 
+
+behavior_track_text_interrupt="True"
+behavior_command_prefix='.'
