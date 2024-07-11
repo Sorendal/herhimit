@@ -1,0 +1,9 @@
+python-dotenv
+sqlalchemy
+asyncmy
+wyoming
+numpy
+librosa
+langchain_core
+langchain_community
+transformers
