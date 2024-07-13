@@ -22,10 +22,9 @@ events dispatched
         audio_data: filelike object containing the audio data
 '''
 
-import logging, array, io, time#, wave
-from collections import deque
+import logging, array, io, asyncio, time#, wave
 from dataclasses import dataclass
-from typing import Deque
+from collections import deque
 
 import numpy as np
 
@@ -37,7 +36,7 @@ from discord.ext import commands, tasks
 import wyoming.client as wyClient
 import wyoming.tts as wyTTS
 
-from utils.datatypes import Piper_TTS
+from utils.datatypes import Piper_TTS, Commands_Bot
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +82,13 @@ class Piper():
         self.audio_data = array.array('h')
         audio_data_np_float = np.divide(audio_data_np, 32768)
 
+        await asyncio.sleep(0.001)
         resampled_audio_np_float = librosa.core.resample(
                 audio_data_np_float, 
                 orig_sr=self.piper_rate, 
                 target_sr=self.output_rate,
                 res_type='linear')
+        await asyncio.sleep(0.001)
 
         resampled_audio_np = np.array(np.multiply(resampled_audio_np_float, 32786), dtype=np.int16)
         if (self.piper_channels != self.output_channels) and (self.piper_channels == 1):
@@ -109,30 +110,30 @@ class Piper():
 
 class TTS_Piper(commands.Cog, Piper):
 
-    def __init__(self, bot:commands.Bot) -> None:
+    def __init__(self, bot: Commands_Bot) -> None:
         Piper.__init__(self)
-        self.bot = bot
-        self.incoming_requests: Deque[Piper_TTS, wyTTS.SynthesizeVoice] = deque()
-        self.processing_requests = False
+        self.bot: Commands_Bot = bot
+        self.queues = self.bot.___custom.queues
         self.setconfig()
+        self.tts_monitor.start()
 
     def setconfig(self):
-        self.piper_host = self.bot.config['TTS_piper_host']
-        self.piper_port = self.bot.config['TTS_piper_port']
-        self.piper_speaker = self.bot.config['TTS_piper_speaker']
-        self.piper_model_name = self.bot.config['TTS_piper_model']
+        self.piper_host = self.bot.___custom.config['TTS_piper_host']
+        self.piper_port = self.bot.___custom.config['TTS_piper_port']
+        self.piper_speaker = self.bot.___custom.config['TTS_piper_speaker']
+        self.piper_model_name = self.bot.___custom.config['TTS_piper_model']
 
     @tasks.loop(seconds=0.1)
     async def tts_monitor(self):
-        if len(self.incoming_requests) == 0:
-            self.tts_monitor.stop()
-            return
-        while len(self.incoming_requests) > 0:
-            logger.debug(f'processing TTS request {self.incoming_requests[0]}')
-            message, wyTTSVoice = self.incoming_requests.popleft()
-            output = await self.process_request(message = message, voice=wyTTSVoice)
+        while self.queues.tts:
+
+            tts_message = self.queues.tts.popleft()
+
+            output = await self.process_request(message = tts_message, voice= tts_message.wyTTSSynth)
             output.message.timestamp_request_end = time.perf_counter()
-            self.bot.dispatch(f'TTS_play', audio=output.audio, message=output.message)
+
+            self.queues.audio_out.append(output.audio)
+
             if output.message.timestamp_request_end != None:
                 if output.message.timestamp_request_start != None:
                     logger.info(f'TTS request processed {(output.message.timestamp_request_end - output.message.timestamp_request_start):.3f}')
@@ -146,17 +147,9 @@ class TTS_Piper(commands.Cog, Piper):
     async def tts_monitor_before_loop(self):
         logger.debug(f'TTS monitor starting')
         pass
-
-    @commands.Cog.listener('on_TTS_event')
-    async def on_TTS_event(self, message: Piper_TTS):
-        logger.debug(f'on TTS_event received')
-        wyTTSVoice = wyTTS.SynthesizeVoice(name=message.model, speaker=message.voice)
-        self.incoming_requests.append((message, wyTTSVoice))
-        if not self.tts_monitor.is_running():
-            await self.tts_monitor.start()
-
+    
     async def cleanup(self):
         pass
         
-async def setup(bot: commands.Bot):
-    await bot.add_cog(TTS_Piper(bot))
+async def setup(bot: commands.Bot, ):
+    await bot.add_cog(TTS_Piper(bot=bot))

@@ -102,14 +102,13 @@ commands - none
 
 '''
 import asyncio, logging, requests, time
-from collections import deque
-from typing import Deque, DefaultDict
+from typing import DefaultDict, Callable
 
 from discord.ext import commands, tasks
 
 from langchain_core.prompts import PromptTemplate, StringPromptTemplate, PipelinePromptTemplate
 
-from utils.datatypes import Discord_Message, Piper_TTS, Speaking_Interrupt, LLM_Prompts, Bot_Character, Halluicanation_Sentences
+from utils.datatypes import Discord_Message, Piper_TTS, Speaking_Interrupt, Halluicanation_Sentences, Commands_Bot, LLM_Prompts
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +128,7 @@ class Bot_LLM:
                  context_length: int,
                  server_type: str,
                  SFW: bool,
-                 messages_to_respond_to: list[Discord_Message],
+                 message_store: dict[int, list[Discord_Message]],
                  message_history_privacy: int) -> None:
         self.host = host
         self.port = port
@@ -137,14 +136,13 @@ class Bot_LLM:
         self.context_length: int = int(context_length)
         self.server_type: str = server_type
         
-        self.message_store: DefaultDict[int, Discord_Message] = {}        
+        self.message_store: DefaultDict[int, Discord_Message] = message_store        
         self.discord_user_messages: DefaultDict[int, set[int]] = {}
 
-        self.last_bot_message: int = None        
+        self.last_bot_message: int = 0
         self.bot_id: int = None
         self.bot_name: str = None
         self.SFW  : bool = SFW
-        self.messages_to_respond_to: list[Discord_Message] = messages_to_respond_to
         self.message_history_privacy: int = message_history_privacy
 
         self.system_prompt: str = "StellaMae"
@@ -169,6 +167,7 @@ class Bot_LLM:
         self.chain_bot = None
         self.stop_generation: bool = False
 
+        
     def setup_prompts(self):
         self.full_template = PromptTemplate.from_template(LLM_Prompts.full_template)
         self.intro_prompt = PromptTemplate.from_template(LLM_Prompts.intro_template)
@@ -243,10 +242,10 @@ class Bot_LLM:
         return PromptTemplate(
             template=f'<|system|>\n You are {{bot_name}} in a chatroom communicating with the {{listener_number}} members {{listeners}} in the room who are friends. Only respond to with users in the chatroom and only those users. ' \
                     + f' Do not mention that you are an assistant or that you are using a language model or AI model.'\
-                    + f' This output will be sent to a text-to-speech program so it is impossible for you to imitate other users. Do not be too nice. Respond in a way '\
+                    + f' This output will be sent to a text-to-speech program so it is impossible for you to imitate other users, so DO NOT TRY. Do not be too nice. Respond in a way '\
                     + f' that is natural to the conversation that address what is being discussed focusing on the messages in the user promp. Do do not repeat messages verbatium. If you do not know the answer to a question, '\
                     + f' say "I don\'t know" and move on to the next question. Do not use emoticons. Do not preface your response with your name' \
-                    + f' focus more on what the user is saying than on your own thoughts. ' \
+                    + f' Focus more on what the user is saying than on your own thoughts. ' \
                     + f' If you see ()~~SomeText~~, it means that the user in the () rudely interrupted you and did not let you finish speaking SomeText. Feel free to express if being interrupred annoyed you.' \
                     + f' The previous messages are as follows: {{history}}'\
                     + f''\
@@ -263,7 +262,7 @@ class Bot_LLM:
 
         if len(self.message_store) == 0:
             message.message_id = 1
-        else:
+        elif not message.message_id:
             message.message_id = max(self.message_store.keys()) + 1
         
         self.message_store[message.message_id] =(message)
@@ -277,7 +276,7 @@ class Bot_LLM:
 
         #self.last_message = message.message_id
 
-    def interupt_sentences(self, interrupt: Speaking_Interrupt):
+    def interupt_sentences(self, interrupt: Speaking_Interrupt) -> Discord_Message:
         '''
         insert '(member_name)~~' into the sentences list before the first sentence 
         that was interrupted and append '~~' to the end of the list. Join the sentences
@@ -292,13 +291,13 @@ class Bot_LLM:
         elif interrupt.num_sentences > len(message.sentences):
             logger.info('ValuteError: num_sentences is greater than the number of sentences in the last message')
             return
-        
-        message.sentences.insert(len(message.sentences) - (interrupt.num_sentences+1), f'({interrupt.member_name.capitalize()})~~')
+
+        message.sentences.insert(len(message.sentences) - (interrupt.num_sentences), 
+                ('(' + ', '.join(member_name.capitalize() for member_name in interrupt.member_names) + ')~~'))
         message.sentences.append('~~')
 
-        message.text = ' '.join(message.sentences)
-        logger.debug(f'Interrupted message: {message.text}')
-
+        message.text_user_interrupt = ' '.join(message.sentences)
+        return self.message_store[self.last_bot_message]
 
     def get_member_message_history(self, member_id: int = None, member_ids: list[int] = None, max_tokens: int = 16768) -> str:
         
@@ -360,47 +359,61 @@ class Bot_LLM:
 
         return response
     
-    async def wmh_stream_sentences(self, message: Discord_Message = None, messages: list[Discord_Message] = None):
+    async def wmh_stream_sentences(self, 
+                message: Discord_Message = None, 
+                messages: list[Discord_Message] = None,
+                response_message: Discord_Message = None):
 
         sentence_seperators = ['.', '?', '\n', '!']
         sentence = ''
 
+        if response_message:
+            response = response_message
+        else:
+            response = Discord_Message(
+                member= self.bot_name,
+                member_id= self.bot_id,
+                listeners= None,
+                listener_names = None,
+            )
+
         if message:
             message.tokens = self.LLM.get_num_tokens(message.text)
+            self.store_message(message)
             query_history = self.get_member_message_history(message.member_id)
             query_input = f'{message.member}: {message.text}'
-            query_listeners = message.listener_names
-            self.store_message(message)
 
-        if messages != None:
-            query_history = self.get_member_message_history(member_ids = [message.member_id for message in messages])
-            query_listeners_set = set()
+            response.listener_names = message.listener_names
+            response.listeners = message.listeners
+        
+        elif messages:
+            query_history = self.get_member_message_history(member_ids = set([message.member_id for message in messages]))
             query_input = ''
             for message in messages:
                 message.tokens = self.LLM.get_num_tokens(message.text)
-                query_listeners_set.union(set(message.listeners))
+                if response.listeners:
+                    response.listeners.union(set(message.listeners))
+                else:
+                    response.listeners = message.listeners.copy()
+                if response.listener_names:
+                    response_message.listener_names.union(message.listener_names)
+                else:
+                    response.listener_names = message.listener_names.copy()
+
                 self.store_message(message)
                 query_input += f'{message.member}: {message.text}\n'
-            query_listeners = list(query_listeners_set)
-
-        response = Discord_Message(
-                member= self.bot_name,
-                member_id= self.bot_id,
-                listeners= message.listeners,
-                listener_names = message.listener_names              
-            )
-
 
         response.sentences = [] 
             # stupid mutibale varible shared between all instances of the class.
 
         try:
+            sentence = ''
             async for chunk in self.chain.astream({
                     'bot_name': self.bot_name,
                     'input': query_input, 
-                    'listeners': query_listeners,
+                    'listeners': ', '.join(response.listener_names),
                     'history': query_history,
-                    'listener_number': str(len(query_listeners))}):
+                    'listener_number': str(len(response.listeners))}):
                 # chunks are strings upto 6ish chars long. Sentances are usually a single char
                 #if len(chunk) != 1:
                 #    sentence += chunk
@@ -423,14 +436,9 @@ class Bot_LLM:
             response.text = ' '.join(response.sentences).strip()
             response.tokens = self.LLM.get_num_tokens(response.text)
             self.store_message(response)
-            self.last_bot_message = response.message_id
-            if self.stop_generation == False:
-                if message != None:
-                    message.reponse_message_id = response.message_id
-                if messages != None:
-                    for message in messages:
-                        response.message_id = response.message_id
-            self.stop_generation = False
+            self.last_bot_message =response.message_id
+            for message in messages:
+                message.reponse_message_id = response.message_id
 
     def _chain(self):
         return (self.prompt 
@@ -438,44 +446,46 @@ class Bot_LLM:
 
 class Bot_Manager(commands.Cog, Bot_LLM):
     def __init__(self, bot) -> None:
-        self.bot:commands.Bot = bot
+        self.bot: Commands_Bot = bot
         self.requests: list[Discord_Message] = []
         self.currently_speaking: list[int] = []
-        self.messages_since_last_response: list[Discord_Message] = []
-        self.messages_being_processed: list[Discord_Message] = []
-        self.last_user_message: dict[int, Discord_Message] = {}
-        self.speaker_pause_time = int(self.bot.config['LLM_speaker_pause_time']) / 1000
+
+        self.speaker_pause_time = int(self.bot.___custom.config['LLM_speaker_pause_time']) / 1000
+
+        self.track_message_interrupt: bool = bool(
+                int(self.bot.___custom.config['behavior_track_text_interrupt']))
+
         Bot_LLM.__init__(self, 
-                host = self.bot.config["LLM_host"], 
-                port = self.bot.config["LLM_port"], 
-                model = self.bot.config['LLM_model'],
-                context_length= self.bot.config['LLM_context_length'],
-                server_type= self.bot.config['LLM_server_type'],
-                api_key= self.bot.config['LLM_api_key'],
-                SFW= self.bot.config['LLM_SFW'],
-                messages_to_respond_to = self.messages_since_last_response,
-                message_history_privacy = self.bot.config['LLM_message_history_privacy'])
-        self.track_message_interrupt: bool = bool(int(self.bot.config['behavior_track_text_interrupt']))
-        #self.botman_monitor.start()
+                host = self.bot.___custom.config["LLM_host"], 
+                port = self.bot.___custom.config["LLM_port"], 
+                model = self.bot.___custom.config['LLM_model'],
+                context_length= self.bot.___custom.config['LLM_context_length'],
+                server_type= self.bot.___custom.config['LLM_server_type'],
+                api_key= self.bot.___custom.config['LLM_api_key'],
+                SFW= self.bot.___custom.config['LLM_SFW'],
+                message_store = self.bot.___custom.message_store,
+                message_history_privacy = self.bot.___custom.config['LLM_message_history_privacy'])
+        
+        self.check_voice_idle = self.bot.___custom.check_voice_idle
+        self.user_speaking = self.bot.___custom.user_speaking
+        self.queues = self.bot.___custom.queues
 
     @tasks.loop(seconds=0.1)
     async def botman_monitor(self):
-        #check to see if the LLM has generated the response for a message in the queue
-        for i, req in reversed(list(enumerate(self.requests))):
-            #logger.info(f'key: {i}, message: {req}')
-            if req.reponse_message_id != None:
-                self.requests.pop(i)
 
-        current_requests = len(self.requests)
+        if self.user_speaking:
+            self.stop_generation = True
+        else:
+            self.stop_generation = False
 
-        if (len(self.currently_speaking) != 0) and (len(self.requests) !=0):
-            logger.info(f'currently speaking {self.currently_speaking}')
-            return
+        # check if the messages have been responded to in self.queue.llm and remove them
+        while (self.queues.llm and self.queues.llm[0].reponse_message_id):
+            self.queues.llm.popleft()
 
-        if current_requests != 0:
-            #logger.info(f'processing LLM request {self.requests}')
-            await self.process_user_messages(messages=self.requests)
-
+        # check voice idle and process messages
+        if self.check_voice_idle(idle_time=self.speaker_pause_time) and self.queues.llm:
+            result = await self.process_user_messages(self.queues.llm.copy())
+            
     @botman_monitor.after_loop
     async def botman_monitor_after_loop(self):
         #self.tts_monitor.stop()
@@ -486,48 +496,24 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         logger.debug(f'monitor starting')
         pass
 
-    def clear_queue(self, message_type: Discord_Message):
-        '''
-        clears the LLM queue of all messages of a given type
-        '''
-        self.incoming_requests = deque([x for x in self.incoming_requests if not isinstance(x, message_type)])
-
-    async def process_user_messages(self, messages: list) -> None:
-        response = ''
-        async for response in self.wmh_stream_sentences(messages=messages):
-            piper_message = Piper_TTS(
+    async def process_user_messages(self, messages: list[Discord_Message]) -> bool:
+        response_message = Discord_Message(
+                member= self.bot_name,
+                member_id= self.bot_id,
+                listener_names= None,
+                listeners= None,
+                message_id= self.bot.___custom.get_message_store_key(),
+            )
+        
+        async for response in self.wmh_stream_sentences(messages=messages, 
+                response_message = response_message):
+            self.queues.tts.append(Piper_TTS(
                 text = response,
                 model = self.voice_model,
-                voice = self.voice_number
-            )
-            self.bot.dispatch('TTS_event', message = piper_message)
-
-        self.messages_since_last_response.clear()
-        self.bot.dispatch(f'LLM_message'
-                , self.message_store[self.last_bot_message])
-        
-    @commands.Cog.listener('on_STT_event')
-    async def on_STT_event(self, message: Discord_Message):
-        logger.debug(f'STT event received {message}')
-        # minimal verification that it wasnt a hallucination
-        if message.text in Halluicanation_Sentences:
-            logger.info(f'Hallucination detected {message.member} text {message.text}')
-            return
-        elif any(message.text.startswith(item) for item in Halluicanation_Sentences):
-            if any(message.text.endswith(item) for item in Halluicanation_Sentences):
-                logger.info(f'Hallucination detected {message.member} text {message.text}')
-                return
-
-        #if user is speaking, send the mesage back to the STT to cache for prefix text
-        if message.member in self.currently_speaking:
-            logger.info(f'got STT event while {message.member} is speaking')
-            self.bot.dispatch('speaker_event_prefix_text', message = message)
-        else:
-            self.requests.append(message)
-            logger.info(f'STT Mes - adding to queue for member {message.member}')
-            self.bot.dispatch('STT_event_HC_passed', message=message)
-            if not self.botman_monitor.is_running():
-                self.botman_monitor.start()
+                voice = self.voice_number,
+                timestamp_request_start=messages[0].timestamp_Audio_End
+            ))
+        self.queues.text_message.append(response_message)
 
     @commands.Cog.listener('on_token_count_request')
     async def on_token_count_request(self, message: Discord_Message) -> int:
@@ -539,54 +525,11 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         for key, message in message_history.items():
             self.message_store.update({key: message})
 
-    @commands.Cog.listener('on_speaker_interrupt')
-    async def on_speaker_interrupt(self, message: Speaking_Interrupt):
-        if not self.track_message_interrupt:
-            return
-        logger.info(f'speaker interrupt received {message.member_name} num sentence {message.num_sentences}')
-        #self.clear_queue(Discord_Message)
-        #self.botman_monitor.stop()
-        self.interupt_sentences(interrupt= message)
-        self.bot.dispatch(f'update_message'
-                , self.message_store[self.last_bot_message])
-        if message.member_name not in self.currently_speaking:
-            self.currently_speaking.append(message.member_name)
-
-    @commands.Cog.listener('on_speaker_interrupt_clear')
-    async def on_speaker_interrupt_clear(self, message: Speaking_Interrupt):
-        if message.member_name in self.currently_speaking:
-            self.currently_speaking.remove(message.member_name)
-        if len(self.currently_speaking) == 0:
-            self.stop_generation = False
-
-    @commands.Cog.listener('on_speaker_event')
-    async def on_speaker_event(self, message: Discord_Message, **kwargs):
-        if message.member in self.currently_speaking:
-            self.currently_speaking.remove(message.member)
-        if len(self.currently_speaking) == 0:
-            self.stop_generation = False
-        #if message.member_id in self.last_user_message.keys():
-        #    if self.last_user_message[message.member_id].timestamp_STT == None:
-        #        self.bot.dispatch('speaker_event_append', 
-        #            previous_message = self.last_user_message[message.member_id],
-        #            new_message = message)
-        #if self.last_user_message[message.member_id].timestamp_Audio_End > time.perf_counter()
-    '''
-    How to handle message continuation
-    if the start time of the new message is less than (.4 sec) the end time of the last message
-    then we should consider it a continuation of the last message. Dispatch a 
-        speaker_event_continuation event and pass the new message and old message as an argument.
-        the STT engine should just disregard the new message (but still process the audio) and 
-        add the text to the old message
-    '''
-
-    @commands.Cog.listener('on_speaker_event')
-    async def on_speaker_event(self, message: Discord_Message, *args, **kwargs):
-        logger.debug(f'speaker event received  {message}')
-        if message.member in self.currently_speaking:
-            self.currently_speaking.remove(message.member)
-        if len(self.currently_speaking) == 0:
-            self.stop_generation = False
+    @commands.Cog.listener('on_speaking_interrupt')
+    async def on_speaking_interrupt(self, speaking_interrupt: Speaking_Interrupt):
+        if self.track_message_interrupt:
+            message = self.interupt_sentences(interrupt = speaking_interrupt)
+            self.queues.text_message.append(message)
 
     @commands.Cog.listener('on_ready')
     async def on_ready(self):
@@ -594,6 +537,8 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         self.bot_id = self.bot.user.id
         self.bot_name = self.bot.user.name
         self.botman_monitor.start()
+        # delay with library load
+        self.LLM.get_num_tokens('The quick brown fox')
 
     async def cleanup(self):
         pass
@@ -603,6 +548,8 @@ async def setup(bot: commands.Bot):
 
 class Bot_Testing(Bot_LLM):
     def __init__(self, config) -> None:
+        self.message_store = {}
+
         Bot_LLM.__init__(self, 
                 host = config["LLM_host"], 
                 port = config["LLM_port"], 
@@ -610,9 +557,10 @@ class Bot_Testing(Bot_LLM):
                 context_length= config['LLM_context_length'],
                 server_type= config['LLM_server_type'],
                 api_key= config['LLM_api_key'],
+                message_store= self.message_store,
                 SFW= config['LLM_SFW'],
-                messages_to_respond_to= None,
                 message_history_privacy=None)
+        self.message_store = {}
         self.bot_name = 'Yasmeen'
         self.bot_id = 1234567890
         #self.update_system_prompt(system_prompt=self.bot_id)

@@ -81,9 +81,9 @@ import logging, asyncio, os
 from dotenv import dotenv_values
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-from utils.datatypes import Discord_Message, Halluicanation_Sentences
+from utils.datatypes import Discord_Message, Commands_Bot
 
 config = dotenv_values('.env')
 
@@ -94,16 +94,61 @@ intents.message_content = True
 
 discord.utils.setup_logging()
 
-bot = commands.Bot(command_prefix=config["behavior_command_prefix"], intents=intents)
+bot = Commands_Bot(command_prefix=config["behavior_command_prefix"], intents=intents, config=config)
+
+#bot = commands.Bot(command_prefix=config["behavior_command_prefix"], intents=intents)
+
+'''
+future ideas:
+    user mute penalty box: track users who speak over other users and give them a penalty box 
+        for a certain amount of time this will be a dictionary with the user id as the key and 
+        the number of times they have spoken over another user as the value
+    STT input coherence check - pass the text to the llm with the history and see if the llm
+        can correct errors in the text (word error rate is still above 6% for the best models)
+
+
+things to check 
+
+    STT - Make sure behavoir is correct for multiple users
+'''
 
 class TextInterface(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.text_channel_title = self.bot.config['client_text_channel']
-        self.track_interrupt = bool(self.bot.config['behavior_track_text_interrupt'])
+    def __init__(self, bot: Commands_Bot):
+        self.bot: Commands_Bot = bot
+        self.text_channel_title = self.bot.___custom.config['client_text_channel']
+        self.track_interrupt = bool(self.bot.___custom.config['behavior_track_text_interrupt'])
         self.text_channel: discord.TextChannel = None
         self.authorized_roles: dict[int, str] = {}
         self.last_message: dict[int, int] = {}
+        self.monitor_loop_count: int = 0
+        self.id_member_name: dict[int, str] = self.bot.___custom.current_listeners
+        self.user_speaking: set[int] = self.bot.___custom.user_speaking
+        self.queues = self.bot.___custom.queues
+        self.display_logs_queue: bool = False
+
+    @tasks.loop(seconds=0.1)
+    async def Text_Monitor(self):
+        self.monitor_loop_count += 1
+        report: list[str] = []
+        # every iteration
+        if report:
+            logging.info('\n'.join(report))
+            
+        if self.monitor_loop_count % 10:
+        # every second
+            if self.display_logs_queue:
+                report.append(f'Queues: stt {len(self.queues.audio_in)}, llm {len(self.queues.llm)}, ')
+                report[-1] = report[-1] + (f'tts {len(self.queues.tts)}, play {len(self.queues.audio_out)} ')
+                report[-1] = report[-1] + (f'db {len(self.queues.db_message)}, text {len(self.queues.text_message)}')
+                if report:
+                    logging.info('\n'.join(report))
+            pass
+        if self.monitor_loop_count % 600 == 0:
+        # every minute
+            pass
+
+        if self.queues.text_message:
+            await self.process_text_message(message=self.queues.text_message.popleft())
 
     async def _connect_text(self):
         if self.text_channel == None:
@@ -129,6 +174,31 @@ class TextInterface(commands.Cog):
     async def cleanup(self):
         pass
     
+    async def process_text_message(self, message: Discord_Message):
+        logging.info(f'Processing text message: Discord Message ID: {message.discord_text_message_id}  Text:{len(message.text)} LLM Correct: {len(message.text_llm_corrected)} User Interrupt: {len(message.text_user_interrupt)}')
+
+        if message.text_llm_corrected or message.text_user_interrupt:
+            try:
+                disc_message = await self.text_channel.fetch_message(message.discord_text_message_id)
+                if message.text_llm_corrected:
+                    await disc_message.edit(content=f':{message.member}: {message.text_llm_corrected} (corrected by LLM)')
+                elif message.text_user_interrupt:
+                    await disc_message.edit(content=f'{message.text_user_interrupt}')
+            except discord.errors.HTTPException as e:
+                logging.info(f"An HTTP exception occurred while fetching message: {e}")
+                self.queues.text_message.appendleft(message)                
+            except discord.NotFound:
+                logging.info("The specified message was not found.")
+            except discord.Forbidden:
+                logging.info("Permission error: fetch messages from this channel, or Discord prevented it.")
+        else:
+            if message.member_id == self.bot.user.id:
+                disc_message =  await self.text_channel.send(f'{message.text}')
+            else:
+                disc_message = await self.text_channel.send(f':{message.member}: {message.text}')
+            message.discord_text_message_id = disc_message.id
+
+
     @commands.Cog.listener('on_connect')
     async def on_connect(self):
         
@@ -139,6 +209,7 @@ class TextInterface(commands.Cog):
         
         await self.text_channel.send("Hello, world!")
         await self._set_authorized_roles()
+        self.Text_Monitor.start()
 
     @commands.command()
     async def list_cogs(self, ctx: commands.context.Context, *args):
@@ -194,7 +265,7 @@ class TextInterface(commands.Cog):
 #            return
 #        extensions = bot.extensions.copy()
 #        ext_dict = {}
-#        for extension in extensions:
+#        for extension in extensions:   
 #            ext_dict.update({f'{extension[5:8].lower()}' : extension})
 #
 #        if cog in ext_dict.keys():
@@ -238,31 +309,14 @@ class TextInterface(commands.Cog):
             self.bot.dispatch('update_username', name=name)
             await ctx.send('I will call you ' + name)
     
-    @commands.Cog.listener('on_STT_event_HC_passed')
-    async def on_STT_event_HC_passed(self, message: Discord_Message, *args, **kwargs):
-        sent_message = await self.text_channel.send(f':{message.member.capitalize()}: {message.text}')
-        self.last_message[message.member_id] = (sent_message.id + 1 - 1)
-
-    @commands.Cog.listener('on_LLM_message')
-    async def on_LLM_message(self, message: Discord_Message):
-        '''
-        create a new message and store the message id in self.last_bot_message_id
-        '''
-        sent_message = await self.text_channel.send(message.text) 
-        self.last_message[message.member_id] = (sent_message.id + 1 - 1)
-
-    @commands.Cog.listener('on_update_message')
-    async def on_update_message(self, message: Discord_Message):
-        if self.track_interrupt == False:
-            return
-        channel_message = await self.text_channel.fetch_message(self.last_message[message.member_id])
-        await channel_message.edit(content=message.text)
-        logging.info(f'Message updated')
-
-    @commands.Cog.listener('on_delete_message')
-    async def on_interrupted_message(self, message: Discord_Message):
-        await self.text_channel.delete_messages(self.last_message[message.member_id])
-
+    @commands.command()
+    async def logq(self, ctx: commands.context.Context):
+        if self.display_logs_queue:
+            self.display_logs_queue = False
+            await ctx.send("Log queue disabled.")
+        else:
+            self.display_logs_queue = True
+            await ctx.send("Log queue enabled.")
 
 @bot.event
 async def on_ready():
@@ -275,8 +329,6 @@ async def load_cogs():
     for file in os.listdir('./cogs'):
         if file.endswith('.py'):
             await bot.load_extension(f'cogs.{file[:-3]}')
-
-bot.config = config
 
 async def main():   
     

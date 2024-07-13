@@ -83,7 +83,7 @@ from sqlalchemy.future import select
 from sqlalchemy.sql.expression import desc, asc
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession, AsyncAttrs
 
-from utils.datatypes import Discord_Message
+from utils.datatypes import Discord_Message, Commands_Bot
 
 str_255 = Annotated[str, mapped_column(String(255))]
 
@@ -125,6 +125,7 @@ class Messages(Base):
     message_text: Mapped[str] = mapped_column(Text, nullable=False)
     listeners: Mapped[list['MessageListeners']] = relationship(back_populates= 'message', lazy='selectin')
     user: Mapped[Users] = relationship(back_populates='messages', lazy='selectin')
+    discord_text_message_id: Mapped[int]
 
 class MessageListeners(Base):
     __tablename__ = 'message_listeners'  # table name
@@ -341,20 +342,20 @@ class SQL_Interface_Base():
         return True
             
 class SQL_Interface(commands.Cog, SQL_Interface_Base):
-    def __init__(self, bot) -> None:
-        self.bot:commands.Bot = bot
+    def __init__(self, bot: Commands_Bot) -> None:
+        self.bot:Commands_Bot = bot
         SQL_Interface_Base.__init__(self)
         self.message_waiting_for_token_count = []
         self.set_config()
 
     def set_config(self):
-        self.host = self.bot.config['sql_db_host']
-        self.port = self.bot.config['sql_db_port']
-        self.user = self.bot.config['sql_db_user']
-        self.password = self.bot.config['sql_db_password']
-        self.database = self.bot.config['sql_db_database']
-        self.server_type = self.bot.config['sql_db_type']
-        self.sqlite_filename = self.bot.config['sql_db_sqlite_file']
+        self.host = self.bot.___custom.config['sql_db_host']
+        self.port = self.bot.___custom.config['sql_db_port']
+        self.user = self.bot.___custom.config['sql_db_user']
+        self.password = self.bot.___custom.config['sql_db_password']
+        self.database = self.bot.___custom.config['sql_db_database']
+        self.server_type = self.bot.___custom.config['sql_db_type']
+        self.sqlite_filename = self.bot.___custom.config['sql_db_sqlite_file']
         self.engine = self.get_engine()
         self.factory = self.get_session_factory()
 
@@ -365,15 +366,13 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
         logger.info('ready')
 
     @commands.Cog.listener('on_LLM_message')
-    async def on_LLM_message(self, message: Discord_Message):
+    async def on_LLM_message(self, message: Discord_Message = None, messages = list[Discord_Message]):
         #logger.info(message)
-        await self.message(message=message)
-
-    @commands.Cog.listener('on_STT_event_HC_pass')
-    async def on_STT_event(self, message: Discord_Message):
-        if message.tokens == 0:
-            self.message_waiting_for_token_count.append(message)
-            self.bot.dispatch('token_count_request', message = message)
+        if message:
+            await self.message(message=message)
+        elif messages:
+            for message in messages:
+                await self.message(message=message)
 
     @commands.Cog.listener('on_tokens_counted')
     async def on_tokens_counted(self, message: Discord_Message):
