@@ -78,6 +78,7 @@ event listeners:
 
 '''
 import asyncio, time, array, time, logging, io
+from datetime import datetime
 
 from dataclasses import dataclass
 from collections import defaultdict
@@ -175,18 +176,18 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             time_diff = current_time - sdata['last_time']
             logger.debug(f'time diff {time_diff:.3f} sdata last time {sdata["last_time"]:3f}')
 
-            message = Discord_Message(
-                    member = sdata['member'],
-                    member_id = sdata['member_id'],
-                    listeners= set(self.listeners.keys()),
-                    listener_names= set(self.listeners.values()),
-                    timestamp_Audio_Start=sdata['start_time'],
-                    timestamp_Audio_End=current_time,
-                )
-
             #check for time diff for end of speaking delay (min_audio_len)
             if time_diff > (self.end_speaking_delay / 1000):
                 if len(sdata['buffer']) > self.min_buffer_length:
+                    message = Discord_Message(
+                            member = sdata['member'],
+                            member_id = sdata['member_id'],
+                            listeners= set(self.listeners.keys()),
+                            listener_names= set(self.listeners.values()),
+                            timestamp_Audio_Start=sdata['start_time'],
+                            timestamp_Audio_End=current_time,
+                            timestamp_creation=datetime.now()
+                            )
                     self.queues.audio_in.append(Audio_Message(message=message, audio_data=sdata['buffer']))
                     self.user_speaking.discard(sdata['member_id'])
                     logger.info(f'Audio added to the STT queue for {message.member}')
@@ -285,7 +286,7 @@ class Audio_Cog(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
         self.voice_client: discord.VoiceClient = None
-        self.voice_channel: discord.VoiceChannel = None
+        self.voice_channel: discord.VoiceChannel = self.bot.___custom.voice_channel
         self.voice_channel_title = self.bot.___custom.config['com_voice_channel']
         self.stt_sink: Speech_To_Text_Sink = None
         self.queues = self.bot.___custom.queues
@@ -294,16 +295,15 @@ class Audio_Cog(commands.Cog):
 
     @commands.Cog.listener('on_connect')
     async def on_connect(self):
-        await asyncio.sleep(5)
-        await self._connect_voice()
+        while not self.voice_client:
+            await self._connect_voice()
+            if not self.voice_client:
+                await asyncio.sleep(1)
         logger.info(f'voice_client_connected {self.voice_client.supported_modes}')
 
-#    @commands.Cog.listener('on_speaker_event')
-#    async def on_speaker_event(self, **kwargs) -> None:
-#        pass
-
     async def _connect_voice(self):
-        self.voice_channel = discord.utils.get(self.bot.get_all_channels(), name=self.voice_channel_title)
+        self.bot.___custom.voice_channel = discord.utils.get(self.bot.get_all_channels(), name=self.voice_channel_title)
+        self.voice_channel = self.bot.___custom.voice_channel
         
         if self.voice_channel is None:
             logger.info("Voice channel not found.")
@@ -320,21 +320,13 @@ class Audio_Cog(commands.Cog):
         
         logger.info(f"Connected to {self.voice_channel_title}")
         self.bot.dispatch('voice_client_connected', 
-                members = self.voice_channel.members,
-                voicechannel=self.voice_channel_title) 
+                members = self.voice_channel.members) 
 
         for member in self.voice_channel.members:
             if member not in self.listeners.keys():
                 self.listeners.update({member.id: member.name})
 
         self.voice_client.listen(self.stt_sink)
-
-    '''        
-    @commands.Cog.listener('on_TTS_play')
-    async def on_TTS_play(self, audio:io.BytesIO, **kwargs):
-        logger.debug('on TTS play received')
-        self.queues.audio_out.append(audio)
-    '''
 
     @AudioSink.listener()
     def on_voice_member_disconnect(self, member: discord.Member, ssrc: Optional[int]) -> None:

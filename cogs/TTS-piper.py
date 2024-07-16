@@ -36,14 +36,9 @@ from discord.ext import commands, tasks
 import wyoming.client as wyClient
 import wyoming.tts as wyTTS
 
-from utils.datatypes import Piper_TTS, Commands_Bot
+from utils.datatypes import TTS_Message, Commands_Bot
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class Piper_Output:
-    audio: io.BytesIO
-    message: Piper_TTS
 
 class Piper():
     def __init__(self) -> None:
@@ -60,11 +55,17 @@ class Piper():
         self.resampled_audio = None
         self.processing_requests = False
 
-    async def process_request(self, message: Piper_TTS, voice: wyTTS.SynthesizeVoice) -> Piper_Output:
+    async def process_request(self, text: str, 
+                voice: wyTTS.SynthesizeVoice,
+                alt_host: str = None,
+                alt_port: int = None) -> io.BytesIO:
 
-        my_client = wyClient.AsyncTcpClient(host=self.piper_host, port=self.piper_port)
+        if alt_host and alt_port:
+            my_client = wyClient.AsyncTcpClient(host=alt_host, port=alt_port)
+        else:
+            my_client = wyClient.AsyncTcpClient(host=self.piper_host, port=self.piper_port)
         await my_client.connect()
-        await my_client.write_event(wyTTS.Synthesize(text=message.text, voice=voice).event())
+        await my_client.write_event(wyTTS.Synthesize(text=text, voice=voice).event())
 
         event = await my_client.read_event()
         while event.type != 'audio-stop':
@@ -106,7 +107,7 @@ class Piper():
         #    wave_file.setsampwidth(self.output_size)
         #    wave_file.writeframesraw(resampled_audio_np_stereo)
 
-        return Piper_Output(message=message, audio=self.resampled_audio)
+        return self.resampled_audio
 
 class TTS_Piper(commands.Cog, Piper):
 
@@ -114,6 +115,7 @@ class TTS_Piper(commands.Cog, Piper):
         Piper.__init__(self)
         self.bot: Commands_Bot = bot
         self.queues = self.bot.___custom.queues
+        self.show_timings = self.bot.___custom.show_timings
         self.setconfig()
         self.tts_monitor.start()
 
@@ -129,24 +131,15 @@ class TTS_Piper(commands.Cog, Piper):
 
             tts_message = self.queues.tts.popleft()
 
-            output = await self.process_request(message = tts_message, voice= tts_message.wyTTSSynth)
-            output.message.timestamp_request_end = time.perf_counter()
+            output = await self.process_request(text = tts_message['text'], 
+                    voice= tts_message['wyTTSSynth'],
+                    alt_host=tts_message['alt_host'],
+                    alt_port=tts_message['alt_port'])
+            
+            self.queues.audio_out.append(output)
 
-            self.queues.audio_out.append(output.audio)
-
-            if output.message.timestamp_request_end != None:
-                if output.message.timestamp_request_start != None:
-                    logger.info(f'TTS request processed {(output.message.timestamp_request_end - output.message.timestamp_request_start):.3f}')
-
-    @tts_monitor.after_loop
-    async def tts_monitor_after_loop(self):
-        logger.debug(f'TTS monitor uping')
-        pass
-
-    @tts_monitor.before_loop
-    async def tts_monitor_before_loop(self):
-        logger.debug(f'TTS monitor starting')
-        pass
+            if self.show_timings:
+                logger.info(f'TTS request processed {(time.perf_counter() - tts_message["timestamp_request_start"]):.3f}')
     
     async def cleanup(self):
         pass

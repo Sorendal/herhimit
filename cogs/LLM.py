@@ -45,70 +45,27 @@ Configuration - expected in the .env config
 
     behavior_track_text_interrupt : bool. If you want the message interrupts to be tracked
 
-Events Dispatched - 
-
-    TTS_event - communitation to the TTS module. The request is generated when
-        the llm finishes the first sentence for less latencty.
-        
-        Piper_TTS object (to be used later)
-
-    LLM_message - 
-        Discord_Message from the LLM response
-
-    tokens_counted - Discord object with the token count from the text of the message
-        Discord_Message
-
-    interrupted_message - Discord_Message when a user interrupts the bot's response. 
-        The interrupted message's test is modified to indicate which sentences
-        were interrupted and then this is dispatched so the SQL database message can be 
-        updated to reflect that.
-
-    STT_event_HC_passed - minimal halucination check passed, for the text interface
-        Discord_Message
-
-    speaker_event_append - checks to see if the previous message has completed transciption
-        and dispatches a message if it has not. Data passed.
-            previous_message: Discord_Message
-            new_message: Discord_Message
-
 Event listeners -
-
-    on_STT_event - transcibed text to be communicated to the llm. expected data
-        discord message
-
-    on_speaker_interrupt_clear - member_id: int
-        remove the memeber id from the currently_speaking list
-
-    on_speaker_event - discord_message
-        remove the member id from the currently_speaking list
 
     on_speaker_interrupt - stop llm generation. expected data is the memeber_id speaking
         and append the data to the current_speaking list
 
-    on_sentence_interrupt - modify bot's history to indicate interrupted
-        sentences
-
     on_message_history - message hisory from DB for a user logging in
         in the form of a dict with the key of a mssage id and value of
         a discord message object
-
-    on_token_count_request - count the tokens of a Discord_Message.text,
-        update the Discord_Message.tokens and dispatch a tokens_counted
-        event. Request from DB to count the tokens of a STT message.
-    
-    on_ready: configure the bots user id and name
-
+   
 commands - none
 
 '''
 import asyncio, logging, requests, time
-from typing import DefaultDict, Callable
+from datetime import datetime
+from typing import DefaultDict
 
 from discord.ext import commands, tasks
 
 from langchain_core.prompts import PromptTemplate, StringPromptTemplate, PipelinePromptTemplate
 
-from utils.datatypes import Discord_Message, Piper_TTS, Speaking_Interrupt, Halluicanation_Sentences, Commands_Bot, LLM_Prompts
+from utils.datatypes import Discord_Message, TTS_Message, Speaking_Interrupt, Halluicanation_Sentences, Commands_Bot, LLM_Prompts
 
 logger = logging.getLogger(__name__)
 
@@ -359,10 +316,8 @@ class Bot_LLM:
 
         return response
     
-    async def wmh_stream_sentences(self, 
-                message: Discord_Message = None, 
-                messages: list[Discord_Message] = None,
-                response_message: Discord_Message = None):
+    async def wmh_stream_sentences(self, messages: list[Discord_Message],
+            response_message: Discord_Message = None):
 
         sentence_seperators = ['.', '?', '\n', '!']
         sentence = ''
@@ -373,35 +328,18 @@ class Bot_LLM:
             response = Discord_Message(
                 member= self.bot_name,
                 member_id= self.bot_id,
-                listeners= None,
-                listener_names = None,
+                listeners= set(),
+                listener_names = set(),
             )
-
-        if message:
-            message.tokens = self.LLM.get_num_tokens(message.text)
-            self.store_message(message)
-            query_history = self.get_member_message_history(message.member_id)
-            query_input = f'{message.member}: {message.text}'
-
-            response.listener_names = message.listener_names
-            response.listeners = message.listeners
         
-        elif messages:
-            query_history = self.get_member_message_history(member_ids = set([message.member_id for message in messages]))
-            query_input = ''
-            for message in messages:
-                message.tokens = self.LLM.get_num_tokens(message.text)
-                if response.listeners:
-                    response.listeners.union(set(message.listeners))
-                else:
-                    response.listeners = message.listeners.copy()
-                if response.listener_names:
-                    response_message.listener_names.union(message.listener_names)
-                else:
-                    response.listener_names = message.listener_names.copy()
-
-                self.store_message(message)
-                query_input += f'{message.member}: {message.text}\n'
+        query_history = self.get_member_message_history(member_ids = set([message.member_id for message in messages]))
+        query_input = ''
+        for message in messages:
+            message.tokens = self.LLM.get_num_tokens(message.text)
+            response.listeners.union(message.listeners)
+            response_message.listener_names.union(message.listener_names)
+            self.store_message(message)
+            query_input += f'{message.member}: {message.text}\n'
 
         response.sentences = [] 
             # stupid mutibale varible shared between all instances of the class.
@@ -435,6 +373,8 @@ class Bot_LLM:
         finally:
             response.text = ' '.join(response.sentences).strip()
             response.tokens = self.LLM.get_num_tokens(response.text)
+            response.timestamp_creation = datetime.now()
+            response.timestamp_LLM = time.perf_counter()
             self.store_message(response)
             self.last_bot_message =response.message_id
             for message in messages:
@@ -466,9 +406,9 @@ class Bot_Manager(commands.Cog, Bot_LLM):
                 message_store = self.bot.___custom.message_store,
                 message_history_privacy = self.bot.___custom.config['LLM_message_history_privacy'])
         
-        self.check_voice_idle = self.bot.___custom.check_voice_idle
         self.user_speaking = self.bot.___custom.user_speaking
         self.queues = self.bot.___custom.queues
+        self.show_timings = self.bot.___custom.show_timings
 
     @tasks.loop(seconds=0.1)
     async def botman_monitor(self):
@@ -481,39 +421,33 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         # check if the messages have been responded to in self.queue.llm and remove them
         while (self.queues.llm and self.queues.llm[0].reponse_message_id):
             self.queues.llm.popleft()
-
+        
         # check voice idle and process messages
-        if self.check_voice_idle(idle_time=self.speaker_pause_time) and self.queues.llm:
+        if self.bot.___custom.check_voice_idle(idle_time=self.speaker_pause_time) and self.queues.llm:
             result = await self.process_user_messages(self.queues.llm.copy())
             
-    @botman_monitor.after_loop
-    async def botman_monitor_after_loop(self):
-        #self.tts_monitor.stop()
-        logger.debug(f'monitor stopping')
-        pass
-    @botman_monitor.before_loop
-    async def botman_monitor_before_loop(self):
-        logger.debug(f'monitor starting')
-        pass
-
     async def process_user_messages(self, messages: list[Discord_Message]) -> bool:
         response_message = Discord_Message(
                 member= self.bot_name,
                 member_id= self.bot_id,
-                listener_names= None,
-                listeners= None,
+                listener_names= set(),
+                listeners= set(),
                 message_id= self.bot.___custom.get_message_store_key(),
+                timestamp_Audio_End= messages[0].timestamp_Audio_End,
             )
         
         async for response in self.wmh_stream_sentences(messages=messages, 
                 response_message = response_message):
-            self.queues.tts.append(Piper_TTS(
-                text = response,
-                model = self.voice_model,
-                voice = self.voice_number,
-                timestamp_request_start=messages[0].timestamp_Audio_End
-            ))
+            self.queues.tts.append(TTS_Message({
+                'text': response, 
+                'timestamp_request_start' : messages[0].timestamp_Audio_End,
+                'wyTTSSynth' : None,
+                'alt_host' : None,
+                'alt_port' : None
+                }))
         self.queues.text_message.append(response_message)
+        if self.show_timings:
+            logger.info(f'LLM request processed {(response_message.timestamp_LLM - response_message.timestamp_Audio_End):.3f}')
 
     @commands.Cog.listener('on_token_count_request')
     async def on_token_count_request(self, message: Discord_Message) -> int:
@@ -531,106 +465,26 @@ class Bot_Manager(commands.Cog, Bot_LLM):
             message = self.interupt_sentences(interrupt = speaking_interrupt)
             self.queues.text_message.append(message)
 
-    @commands.Cog.listener('on_ready')
-    async def on_ready(self):
+    @commands.Cog.listener('on_connect')
+    async def on_connect(self):
         logger.info(f'LLM interface is ready')
         self.bot_id = self.bot.user.id
         self.bot_name = self.bot.user.name
         self.botman_monitor.start()
         # delay with library load
         self.LLM.get_num_tokens('The quick brown fox')
+        logger.info('LLM model is ready')
+
+    @commands.Cog.listener('on_ready')
+    async def on_ready(self, *args, **kwargs): 
+        if 'DB' in kwargs.keys():
+            self.bot.___custom.get_message_store_key(set=kwargs[''])
+        pass
 
     async def cleanup(self):
+        if self.botman_monitor:
+            self.botman_monitor.stop()
         pass
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Bot_Manager(bot))
-
-class Bot_Testing(Bot_LLM):
-    def __init__(self, config) -> None:
-        self.message_store = {}
-
-        Bot_LLM.__init__(self, 
-                host = config["LLM_host"], 
-                port = config["LLM_port"], 
-                model = config['LLM_model'],
-                context_length= config['LLM_context_length'],
-                server_type= config['LLM_server_type'],
-                api_key= config['LLM_api_key'],
-                message_store= self.message_store,
-                SFW= config['LLM_SFW'],
-                message_history_privacy=None)
-        self.message_store = {}
-        self.bot_name = 'Yasmeen'
-        self.bot_id = 1234567890
-        #self.update_system_prompt(system_prompt=self.bot_id)
-        
-    async def test_history(self):
-        queryA1 = Discord_Message(member='Alice', text='Can you remeber my favorite ice cream is rocky road?', member_id=1001, listeners=[1001], listener_names=['Alice'])
-        queryA2 = Discord_Message(member='Alice', text='what was is my favorite ice cream?', member_id=1001, listeners=[1001], listener_names=['Alice'])
-        queryB1 = Discord_Message(member='Bob', text='Yo? Whats Alices favorite ice cream?', member_id=2002, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryA3 = Discord_Message(member='Alice', text='Go ahead and tell him', member_id=1001, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryB2 = Discord_Message(member='Bob', text='Yo? Whats Alices favorite ice cream? Did I just interrupt you? Are you a computer?', member_id=2002, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryA4 = Discord_Message(member='Alice', text='Hey my favorite kind of dog is a Shih Tzu, what is yous bob?', member_id=1001, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryB3 = Discord_Message(member='Bob', text='Bleh, small dogs suck. Give me a Great Dane any day', member_id=2002, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryA5 = Discord_Message(member='Alice', text='Great danes... hope you like heart ache, they dont live long. Yasmeen, my name is Alice, not ice.', member_id=1001, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryB5 = Discord_Message(member='Bob', text='Thats one of the reasons I love em, new personalities every couple of years. That shih tzu is gonna be around forever', member_id=2002, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryA6 = Discord_Message(member='Alice', text='Hey... I love my little Shih Head. Back off you fucker', member_id=1001, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-        queryB6 = Discord_Message(member='Bob', text='You are such a wussie with your attachment issues', member_id=2002, listeners=[1001, 2002], listener_names=['Alice', 'Bob'])
-
-        async for chunk in self.wmh_stream_sentences(messages=[queryA1]):
-            pass
-        async for chunk in self.wmh_stream_sentences(messages=[queryA2]):
-            pass
-        async for chunk in self.wmh_stream_sentences(messages=[queryB1]):
-            pass
-        async for chunk in self.wmh_stream_sentences(messages=[queryA3]):
-            pass
-        self.interupt_sentences(Speaking_Interrupt(num_sentences=1, member_id=2002, member_name='Bob'))
-        async for chunk in self.wmh_stream_sentences(messages=[queryB2]):
-            pass
-        async for chunk in self.wmh_stream_sentences(messages=[queryA4, queryB3]):
-            pass
-        async for chunk in self.wmh_stream_sentences(messages=[queryA5, queryB5, queryA6, queryB6]):
-            pass
-
-        print()
-
-        for item in self.message_store.values():
-            print(f'{item.message_id} {item.member} {item.text}')
-            print()
-
-        for item in self.discord_user_messages.values():
-            print(f'{item}')
-            #{item.text}')
-            print()
-
-if __name__ == '__main__':
-    async def main():
-        import argparse    
-        from dotenv import dotenv_values
-        
-        config = dotenv_values('../.env')
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("-th", "--test_history", action= 'store_true', help="Test the connection to the database")
-        parser.add_argument("-pp", "--print_prompt", action= 'store_true', help="Test the connection to the database")
-
-        my_llm =Bot_Testing(config=config)
-
-        args = parser.parse_args()
-        if args.test_history:
-            print(await my_llm.test_history())
-        if args.print_prompt:
-            print(await my_llm.test_history())
-
-        await my_llm.test_history()
-        '''listeners= ["listener1", "listener2"]
-        print(my_llm.prompt.format(
-                bot_name=my_llm.bot_name,
-                history="---some history------some history------some history------some history------some history---",
-                input="---some input---",
-                listeners= ", ".join(listeners),
-            ))
-        '''
-    asyncio.run(main())
