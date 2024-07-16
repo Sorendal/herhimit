@@ -1,10 +1,22 @@
-import io, time, asyncio
+import io, time
+from datetime import datetime
+from typing import TypedDict, Optional, NotRequired
 from dataclasses import dataclass
 from collections import deque
 
+from discord import VoiceChannel, TextChannel
 from discord.ext import commands
 
 from wyoming import tts as wyTTS
+
+# for the DB cog so the queues can
+#   lint properly
+#   length can be inspected
+class DB_InOut(TypedDict):
+    member_id: int
+    in_time: datetime
+    out_time: datetime
+    db_commit: NotRequired[bool]
 
 @dataclass
 class Discord_Message:
@@ -23,20 +35,18 @@ class Discord_Message:
     timestamp_STT: float = None
     timestamp_LLM: float = None
     timestamp_TTS: float = None
+    timestamp_creation: float = None
     reponse_message_id: int = None
     stored_in_db: bool = False
     discord_text_message_id: int = None # -1 if restored message from db
+    discord_retry: int = 0
 
-@dataclass
-class Piper_TTS:
+class TTS_Message(TypedDict):
     text: str
-    model: str
-    voice: str
-    timestamp_request_start: float = None
-    timestamp_request_end: float = None
-    wyTTSSynth: wyTTS.SynthesizeVoice = None
-#    host: str # future plans: multiple servers to avoid loading lag for voice models
-#    port: int
+    timestamp_request_start: float 
+    wyTTSSynth: wyTTS.SynthesizeVoice
+    alt_host: str # future plans: multiple servers to avoid loading lag for voice models
+    alt_port: int
 
 @dataclass
 class Speaking_Interrupt:
@@ -49,8 +59,15 @@ class Audio_Message:
     audio_data: io.BytesIO
     message: Discord_Message
 
-Halluicanation_Sentences = ('Thank you.', 'Bye-bye.', 'Thanks for watching!', 'Thanks for watching.',
-    'Thank you for watching.', "I'll see you next time.", '  Thank you so much for watching.', "Next time.")
+Halluicanation_Sentences = (
+    'thank you', 
+    'bye-bye', 
+    'thanks for watching',
+    'thank you for watching',
+    "i'll see you next time", 
+    "i will see you next time", 
+    'thank you so much for watching',
+    "next time")
 
 @dataclass
 class Commands_Bot(commands.Bot):
@@ -71,26 +88,13 @@ class Commands_Bot(commands.Bot):
 @dataclass
 class Queue_Container():
     def __init__(self):
-        #self.audio_in: asyncio.Queue[Audio_Message] = asyncio.Queue(maxsize=10)
-        #self.audio_out: asyncio.Queue[Audio_Message] = asyncio.Queue(maxsize=30)
-        #self.llm: asyncio.Queue[Discord_Message] = asyncio.Queue()
-        #self.tts: asyncio.Queue[Piper_TTS] = asyncio.Queue()
-        #self.db_message: asyncio.Queue[Discord_Message] = asyncio.Queue()
-        #self.text_message: asyncio.Queue[Discord_Message] = asyncio.Queue()
-        
-        #self.audio_in: list[Audio_Message] = []
-        #self.audio_out: list[io.BytesIO] = []
-        #self.llm: list[Discord_Message] = []
-        #self.tts: list[Piper_TTS] = []
-        #self.db_message: list[Discord_Message] = []
-        #self.text_message: list[Discord_Message] = []
-
         self.audio_in: deque[Audio_Message] = deque()
         self.llm: deque[Discord_Message] = deque()
-        self.tts: deque[Piper_TTS] = deque()
+        self.tts: deque[TTS_Message] = deque()
         self.audio_out: deque[io.BytesIO] = deque()
         self.db_message: deque[Discord_Message] = deque()
         self.text_message: deque[Discord_Message] = deque()
+        self.db_loginout: deque[DB_InOut] = deque()
 
 @dataclass
 class Discord_Container():
@@ -102,6 +106,9 @@ class Discord_Container():
         self.current_listeners: dict = {}
         self.message_store: dict = {}
         self.message_store_latest_key: int = 0
+        self.voice_channel: VoiceChannel = None
+        self.text_channel: TextChannel = None
+        self.show_timings: bool = False
 
     def get_message_store_key(self, get_current: bool = False, set: int = None) -> int:
         '''
