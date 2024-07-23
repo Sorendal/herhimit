@@ -87,9 +87,11 @@ from concurrent.futures import Future as CFuture
 
 import discord
 from discord.ext import commands, voice_recv, tasks
+
 from discord.ext.voice_recv import AudioSink
 
-from utils.datatypes import Discord_Message, Speaking_Interrupt, Audio_Message, Commands_Bot
+from scripts.discord_ext import Commands_Bot
+from utils.datatypes import Discord_Message, Speaking_Interrupt, Audio_Message
 
 logger = logging.getLogger(__name__)
 #logger.setLevel(logging.DEBUG)
@@ -185,7 +187,7 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
                             listeners= set(self.listeners.keys()),
                             listener_names= set(self.listeners.values()),
                             timestamp_Audio_Start=sdata['start_time'],
-                            timestamp_Audio_End=current_time,
+                            timestamp_Audio_End=datetime.now(),
                             timestamp_creation=datetime.now()
                             )
                     self.queues.audio_in.append(Audio_Message(message=message, audio_data=sdata['buffer']))

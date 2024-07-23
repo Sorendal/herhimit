@@ -70,7 +70,10 @@ from dotenv import dotenv_values
 import discord
 from discord.ext import commands, tasks
 
-from utils.datatypes import Discord_Message, Commands_Bot, DB_InOut
+from scripts.discord_ext import Commands_Bot
+
+from utils.datatypes import Discord_Message
+from utils.utils import time_diff
 
 config = dotenv_values('.env')
 
@@ -104,6 +107,9 @@ class TextInterface(commands.Cog):
         self.text_channel_title = self.bot.___custom.config['client_text_channel']
         self.track_interrupt = bool(self.bot.___custom.config['behavior_track_text_interrupt'])
         self.bot.___custom.show_timings = bool(self.bot.___custom.config['performance_show_timings'])
+        self.bot.___custom.show_text = bool(self.bot.___custom.config['performance_show_text'])
+        self.bot.___custom.TTS_enable = bool(self.bot.___custom.config['behavior_TTS_enable'])
+        self.bot.___custom.db_always_connected = bool(self.bot.___custom.config['performance_db_always_connected'])
         self.show_timings = self.bot.___custom.show_timings
         self.text_channel: discord.TextChannel = None
         self.authorized_roles: dict[int, str] = {}
@@ -140,11 +146,6 @@ class TextInterface(commands.Cog):
         return 'Queues: ' + ', '.join([f'{item}: {len(getattr(self.queues, item))}' 
                     for item in vars(self.queues)])
 
-        #return_string = 'Queues: '
-        #for item in vars(self.queues):
-        #    return_string += f'{item} {len(getattr(self.queues, item))}, '
-        #return return_string
-
     async def _connect_text(self):
         if self.text_channel == None:
             self.text_channel = discord.utils.get(self.bot.get_all_channels(), 
@@ -170,16 +171,17 @@ class TextInterface(commands.Cog):
         pass
     
     async def process_text_message(self, message: Discord_Message):
-        logging.info(f'Processing text message: Discord Message ID: {message.discord_text_message_id}  Text:{len(message.text)} LLM Correct: {len(message.text_llm_corrected)} User Interrupt: {len(message.text_user_interrupt)}')
-
-        #edited message
+        if self.show_timings:
+            if self.bot.___custom.show_text:
+                logging.info(self.report_text_info(disc_message=message))
+        # edited message
         if message.text_llm_corrected or message.text_user_interrupt:
             try:
                 disc_message = await self.text_channel.fetch_message(message.discord_text_message_id)
                 if message.text_llm_corrected:
-                    await disc_message.edit(content=f':{message.member}: {message.text_llm_corrected} (corrected by LLM)')
+                    await disc_message.edit(content=f':{message.member}: {message.text} (corrected by LLM)')
                 elif message.text_user_interrupt:
-                    await disc_message.edit(content=f'{message.text_user_interrupt}')
+                    await disc_message.edit(content=f'{message.text}')
             except discord.errors.HTTPException:
                 if message.discord_retry == 2:
                     logging.info("Max retries exceeded for editing the message. Discarding message")
@@ -207,9 +209,31 @@ class TextInterface(commands.Cog):
                 else:
                     message.discord_retry += 1
                     self.queues.text_message.appendleft(message)                
-                logging.info(f"An HTTP exception occurred while sending message")
+                    logging.info(f"An HTTP exception occurred while sending message")
             except discord.Forbidden:
                 logging.info("Permission error: send messages to this channel, or Discord prevented it.")
+
+    def report_text_info(self, disc_message: Discord_Message) -> str:
+        output_text = ''
+        if self.bot.___custom.show_text:
+            if disc_message.text:
+                output_text += f'Text: {disc_message.text} '
+            if disc_message.text_llm_corrected:
+                output_text += f'LLM Corrected Text: {disc_message.text_llm_corrected} '
+            if disc_message.text_user_interrupt:
+                output_text += f'User Interrupted Text: {disc_message.text_user_interrupt} '
+        if self.bot.___custom.show_timings and self.bot.___custom.show_text:
+            output_text += '\n'
+        if self.show_timings:
+            if disc_message.timestamp_STT:
+                output_text += f'Timing: STT:{time_diff(disc_message.timestamp_STT, disc_message.timestamp_Audio_End)}'
+            if disc_message.timestamp_LLM:
+                output_text += f' LLM:{time_diff(disc_message.timestamp_LLM, disc_message.timestamp_Audio_End)}'
+            if disc_message.timestamp_TTS_start:
+                output_text += f' TTS:({time_diff(disc_message.timestamp_TTS_start, disc_message.timestamp_Audio_End)}'
+            if disc_message.timestamp_TTS_end:
+                output_text += f'-{time_diff(disc_message.timestamp_TTS_end, disc_message.timestamp_Audio_End)}'
+        return output_text        
 
     @commands.Cog.listener('on_connect')
     async def on_connect(self):
@@ -252,24 +276,11 @@ class TextInterface(commands.Cog):
             await bot.reload_extension(ext_dict[cog])
             logging.info(f'Reloaded {ext_dict[cog]}')
         await ctx.send('Done.')
-
-    @commands.command()
-    async def rdb(self, ctx: commands.context.Context):
-        """Reloads the database"""
-        if self.check_auth(ctx) == False:
-            await ctx.send("You are not authorized to use this command.")
-            return
-        bot.dispatch('reload_database')
-
-    @commands.Cog.listener('on_db_ready_reload')
-    async def on_db_ready_reload(self):
-        """Reloads the database"""
-        await self.reload(cog='db-')
-
+    
     @commands.command()
     async def unload(self, ctx: commands.context.Context, cog: str):
         """Unloads a cog. name shortened to 3 letters after cogs."""
-        if self.check_auth(ctx) == False:
+        if not self.check_auth(ctx):
             await ctx.send("You are not authorized to use this command.")
             return
         extensions = bot.extensions.copy()
@@ -312,7 +323,7 @@ class TextInterface(commands.Cog):
     async def die (self, ctx: commands.context.Context, *args):
         '''calls cleanup in all cogs and then exits'''
         if self.check_auth(ctx) == False:
-            await ctx.send("You are not authorized to use this command.")
+            await ctx.send("You are not authorized to use this command.", delete_after=5)
             return
         for extension in bot.cogs:
             try:
@@ -321,6 +332,7 @@ class TextInterface(commands.Cog):
                 await working_cog.cleanup()
             except Exception as e:
                 logging.error(f'Error cleaning up {extension}: {e}')
+        await ctx.message.delete()
         await ctx.send('Bye!')
         await bot.close()
 
@@ -336,29 +348,68 @@ class TextInterface(commands.Cog):
             await ctx.send('I will call you ' + name)
     
     @commands.command()
-    async def logq(self, ctx: commands.context.Context):
-        if self.display_logs_queue:
-            self.display_logs_queue = False
-            await ctx.send("Log queue disabled.")
-        else:
-            self.display_logs_queue = True
-            await ctx.send("Log queue enabled.")
-    
-    @commands.command()
-    async def ii(self, ctx: commands.context.Context):
-        for item in self.queues.db_loginout:
-            logging.info(item)
+    async def log(self, ctx: commands.context.Context, arg1: str):
+        if not self.check_auth(ctx):
+            await ctx.send("You are not authorized to use this command.", delete_after=5)
+        # enable log to show queues
+        elif arg1 == 'q':
+            if self.display_logs_queue:
+                self.display_logs_queue = False
+                await ctx.send("Log queue disabled.")
+            else:
+                self.display_logs_queue = True
+                await ctx.send("Log queue enabled.")
+        # enable log to show message history
+        elif arg1 == 'mh':
+            if self.bot.___custom.display_message_history == True:
+                self.bot.___custom.display_message_history = False
+                await self.text_channel.send('Message history disabled.', delete_after=5)
+            else:
+                self.bot.___custom.display_message_history = True
+                await self.text_channel.send('Message history enabled.', delete_after=5)
 
-#@bot.event98
-#async def on_ready(*args):
-#    logging.info(f'{bot.user.name} {bot.user.id} has connected to Discord!')
+        #delete the sent message
+        await ctx.message.delete(delay=5)
+
+    @commands.command()
+    async def toggle(self, ctx: commands.context.Context, arg1):
+        '''toggles options 
+            db = db_always_connected
+            text = show text in log
+        '''
+        if not self.check_auth(ctx):
+            await ctx.send("You are not authorized to use this command.", delete_after=5)
+        elif arg1 == 'db':
+            if self.bot.___custom.db_always_connected:
+                self.bot.___custom.db_always_connected = False
+                await ctx.send("DB connection will disconnect when not idle.", delete_after=5)
+            else:
+                self.bot.___custom.db_always_connected = True
+                await ctx.send("DB connection will stay connected.", delete_after=5)
+        elif arg1 == 'text':
+            if self.bot.___custom.show_text:
+                self.bot.___custom.show_text = False
+                await ctx.send(f"Text logging is now disabled.", delete_after=5)
+            else:
+                self.bot.___custom.show_text = True
+                await ctx.send("Text logging is now enabled.", delete_after=5)
+        elif arg1 == 'tts':
+            if self.bot.___custom.TTS_enable:
+                self.bot.___custom.TTS_enable = False
+                await ctx.send("TTS is now disabled.", delete_after=5)
+            else:
+                self.bot.___custom.TTS_enable = True
+                await ctx.send("TTS is now enabled.", delete_after=5)
+
+        #delete the sent message
+        await ctx.message.delete(delay=5)
 
 async def load_cogs():
     #Intentionally kept text cog integrated to the main bot
     await bot.add_cog(TextInterface(bot))
 
     for file in os.listdir('./cogs'):
-        if file.endswith('.py'):
+        if (file.endswith('.py') and not file.startswith('__')):
             await bot.load_extension(f'cogs.{file[:-3]}')
 
 async def main():   

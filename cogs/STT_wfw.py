@@ -6,87 +6,40 @@ Audio in is process through the deque audio_in containing Audio_Message(audio da
 The text is added to the Discord_Message and sent to the deque LLM for further processing.
     if the last message in the LLM queue has the same member_id as the current message, it will be merged with that message.
 '''
-import array, logging, time
+import logging
+from datetime import datetime
 
 from discord.ext import commands, tasks
 from discord.opus import Decoder as DiscOpus
 from typing import Union 
 
-import wyoming.mic as wyMic
-import wyoming.asr as wyAsr
-import wyoming.audio as wyAudio
-import wyoming.client as wyClient
-
-from utils.datatypes import Discord_Message, Commands_Bot, Audio_Message, Halluicanation_Sentences
+from scripts.STT_wfw import transcribe
+from scripts.discord_ext import Commands_Bot
+from utils.datatypes import Discord_Message, Halluicanation_Sentences
+from utils.utils import time_diff
 
 logger = logging.getLogger(__name__)
 
-class WFW():
-    def __init__(self, host:str, port:int, input_rate: int, input_channels: int, input_width):
-        self.host = host
-        self.port = port
-        self.rate = input_rate
-        self.channels = input_channels
-        self.width = input_width
-        self.payload_size = 1000
-
-    async def wfw_transcribe(self, audio_data: array.array) -> str:
-        timestamp: int = 0
-        my_audio_chunks = []
-        start = 0
-
-        # wyoming protocol data list (home assistant voice)
-        while len(audio_data) > start:
-            end = start +  self.payload_size
-            audio_segment = audio_data[start:end]
-            my_audio_chunks.append(wyAudio.AudioChunk(
-                rate = self.rate,
-                width = self.width,
-                channels= self.channels,
-                audio=audio_segment.tobytes(),
-                timestamp=timestamp            
-                ))
-            timestamp += my_audio_chunks[-1].timestamp + int(
-                len(my_audio_chunks[-1].audio) / (self.rate * self.width * self.rate)  * 1000)
-            start = end
-
-        #wyoming tranmission start
-        my_client = wyClient.AsyncTcpClient(host=self.host, 
-                                            port=self.port)
-        await my_client.connect()
-        await my_client.write_event(wyAsr.Transcribe().event())
-        await my_client.write_event(wyAudio.AudioStart(
-            rate=self.rate, 
-            width=self.width, 
-            channels=self.channels).event())        
-        for item in my_audio_chunks:
-            await my_client.write_event(item.event())
-        await my_client.write_event(wyAudio.AudioStop().event())        
-        response = await my_client.read_event()
-        
-        return response.data['text']
-
-class STT_wfw(commands.Cog, WFW):
+class STT_wfw(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
-        WFW.__init__(self=self, 
-                host=bot.___custom.config['STT_WFW_host'], 
-                port=bot.___custom.config['STT_WFW_port'], 
-                input_rate=DiscOpus.SAMPLING_RATE, 
-                input_channels=DiscOpus.CHANNELS, 
-                input_width=DiscOpus.SAMPLE_SIZE)
 
         self.queues = self.bot.___custom.queues
         self.user_speaking: set[int] = self.bot.___custom.user_speaking
         self.user_last_message: dict[int, float] = self.bot.___custom.user_last_message
-        self.time_between_messages: float = self.bot.___custom.config['behavior_time_between_messages']
+        self.time_between_messages: float = float(self.bot.___custom.config['behavior_time_between_messages'])
+        self.host = self.bot.___custom.config['STT_host']
+        self.port = self.bot.___custom.config['STT_port']
 
         self.STT_monitor.start()
 
     def halluicanation_check(self, text: str) -> Union[str, None]:
         '''
           minimal verification that it wasnt a hallucination: returns the string if passed, None if not
-          removes trailing punctuation and lowercases the text
+          removes trailing punctuation and lowercases the text.
+
+          this usually happens when from silence being fed to whisper and its training data.
+          Yes, it probably was trained with youtu
         '''
         hc = True
         text = text.strip()
@@ -109,29 +62,36 @@ class STT_wfw(commands.Cog, WFW):
         if self.queues.audio_in:
             incoming_audio = self.queues.audio_in.popleft()
             message = incoming_audio.message
-            response = await self.wfw_transcribe(incoming_audio.audio_data)
+            response = await transcribe(
+                    audio_data=incoming_audio.audio_data,
+                    host=self.host,
+                    port=self.port,
+                    input_channels=DiscOpus.CHANNELS,
+                    input_rate=DiscOpus.SAMPLING_RATE,
+                    input_width=DiscOpus.SAMPLE_SIZE)
             message.text = self.halluicanation_check(response)
             if not message.text:
                 # hallucination detected, discard the message and return
                 return
-            message.timestamp_STT = time.perf_counter()
+            message.timestamp_STT = datetime.now()
 
         #check to see if the last message in the LLM queue is by the same member and update the data
             if self.queues.llm:
-                if (self.queues.llm[-1].member_id == message.member_id) and ((self.queues.llm[-1].timestamp_Audio_End - message.timestamp_Audio_End) < self.time_between_messages):
+                if (self.queues.llm[-1].member_id == message.member_id) and ((self.queues.llm[-1].timestamp_Audio_End - message.timestamp_Audio_End).total_seconds() < self.time_between_messages):
                     current_message = self.queues.llm[-1]
                     current_message.text += ' ' + message.text
                     current_message.timestamp_Audio_End = message.timestamp_Audio_End
+                    current_message.timestamp_STT = message.timestamp_STT
                     current_message.listener_names.union(message.listener_names)
                     current_message.listeners.union(message.listeners)
-                    logger.info(f'STT - Update LLM message {(message.timestamp_STT - message.timestamp_Audio_End):.3f} {message.member} {message.text}')
+                    logger.info(f'STT - Update LLM message {time_diff(current_message.timestamp_STT, current_message.timestamp_Audio_End)} {current_message.member} {current_message.text}')
             else:
                 # new messages are added to the DB and LLM queues. 
                 message.message_id = self.bot.___custom.get_message_store_key()
                 self.queues.llm.append(message)
                 self.queues.db_message.append(message)
                 self.queues.text_message.append(message)
-                logger.info(f'STT - New LLM message {(message.timestamp_STT - message.timestamp_Audio_End):.3f} {message.member} {message.text}')
+                logger.info(f'STT - New LLM message {(time_diff(message.timestamp_Audio_End, message.timestamp_STT))}')#.total_seconds():.3f} {message.member} {message.text}')
                 
     async def cleanup(self):
         if self.STT_monitor.is_running():
