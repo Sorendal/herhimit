@@ -80,7 +80,6 @@ event listeners:
 import asyncio, time, array, time, logging, io
 from datetime import datetime
 
-from dataclasses import dataclass
 from collections import defaultdict
 from typing import TYPE_CHECKING, TypedDict, Union, Optional, Awaitable, TypeVar
 from concurrent.futures import Future as CFuture
@@ -91,7 +90,7 @@ from discord.ext import commands, voice_recv, tasks
 from discord.ext.voice_recv import AudioSink
 
 from scripts.discord_ext import Commands_Bot
-from utils.datatypes import Discord_Message, Speaking_Interrupt, Audio_Message
+from scripts.datatypes import Discord_Message, Speaking_Interrupt, Audio_Message
 
 logger = logging.getLogger(__name__)
 #logger.setLevel(logging.DEBUG)
@@ -113,8 +112,6 @@ class StreamData(TypedDict):
 class Speech_To_Text_Sink(voice_recv.AudioSink):
     def __init__(self,
                 bot: Commands_Bot, 
-                play_queue: list,
-                listeners: dict[int, str],
                 min_audio_len: int = 500,
                 end_speaking_delay: int = 200,
                 interrupt_time: int = 100,
@@ -122,27 +119,31 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
         super().__init__()
         self.bot: Commands_Bot = bot
         self.members: list = []
+
+        # wondering if these should just be hard coded
         self.channels = discord.opus.Decoder.CHANNELS
         self.width = discord.opus.Decoder.SAMPLE_SIZE
         self.rate = discord.opus.Decoder.SAMPLING_RATE
+
+        self.min_audio_length = min_audio_len
+        self.min_buffer_length = self.width * self.channels * self.min_audio_length * self.rate // 1000
+        self.audio_packet_length = self.rate * self.width * self.channels // 20
+        #self.audio_buffer_padding: float = .25 #attempt to padd the audio to see if it impoves speech recognition
+
         self.min_audio_length: int = min_audio_len # in msec
         self.end_speaking_delay: int = end_speaking_delay # in msec
         self.interrupt_time:float = interrupt_time / 1000
+
         self.ignore_silence_packets: bool = True
         self.audio_buffer_dict: defaultdict[int, StreamData] = defaultdict(
-            lambda: StreamData(buffer=array.array('b'), last_time=None, member=None, ssrc=None, member_id=None)
-            )
+            lambda: StreamData(buffer=array.array('b'), last_time=None, member=None, ssrc=None, member_id=None)            )
 
-        self.min_buffer_length = self.width * self.channels * self.min_audio_length * self.rate // 1000
-        self.user_speaking:set[int] = self.bot.___custom.user_speaking
-        self.user_last_message:dict[int, float] = self.bot.___custom.user_last_message
+        self.listeners: dict[int, str] = self.bot.custom.current_listeners
+        self.queues = self.bot.custom.queues
+        self.user_speaking:set[int] = self.bot.custom.user_speaking
+        self.user_last_audio:dict[int, float] = self.bot.custom.last_user_audio
 
-        self.listeners: dict[int, str] = self.bot.___custom.current_listeners #listeners
-        self.audio_packet_length = self.rate * self.width * self.channels // 20
-        #self.audio_buffer_padding: float = .25 #attempt to padd the audio to see if it impoves speech recognition
-        self.queues = self.bot.___custom.queues
         self.monitor.start()
-
 
     @tasks.loop(seconds=0.1)    
     async def monitor(self):
@@ -182,17 +183,18 @@ class Speech_To_Text_Sink(voice_recv.AudioSink):
             if time_diff > (self.end_speaking_delay / 1000):
                 if len(sdata['buffer']) > self.min_buffer_length:
                     message = Discord_Message(
-                            member = sdata['member'],
-                            member_id = sdata['member_id'],
-                            listeners= set(self.listeners.keys()),
+                            user_name = sdata['member'].capitalize(),
+                            user_id =  sdata['member_id'],
+                            listener_ids = set(self.listeners.keys()),
                             listener_names= set(self.listeners.values()),
                             timestamp_Audio_Start=sdata['start_time'],
                             timestamp_Audio_End=datetime.now(),
-                            timestamp_creation=datetime.now()
+                            timestamp = datetime.now(),
                             )
+                    self.user_last_audio[message.user_id] = time.perf_counter()
                     self.queues.audio_in.append(Audio_Message(message=message, audio_data=sdata['buffer']))
                     self.user_speaking.discard(sdata['member_id'])
-                    logger.info(f'Audio added to the STT queue for {message.member}')
+                    logger.info(f'Audio added to the STT queue for {message.user_name}')
                 else:
                     #this state should never occur
                     logger.info(f'buffer {len(sdata["buffer"])} expected {self.min_buffer_length}')
@@ -288,12 +290,12 @@ class Audio_Cog(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
         self.voice_client: discord.VoiceClient = None
-        self.voice_channel: discord.VoiceChannel = self.bot.___custom.voice_channel
-        self.voice_channel_title = self.bot.___custom.config['com_voice_channel']
+        self.voice_channel: discord.VoiceChannel = self.bot.custom.voice_channel
+        self.voice_channel_title = self.bot.custom.config['com_voice_channel']
         self.stt_sink: Speech_To_Text_Sink = None
-        self.queues = self.bot.___custom.queues
-        self.listeners: dict[int, str] = self.bot.___custom.current_listeners
-        self.user_speaking: set[int] = self.bot.___custom.user_speaking
+        self.queues = self.bot.custom.queues
+        self.listeners: dict[int, str] = self.bot.custom.current_listeners
+        self.user_speaking: set[int] = self.bot.custom.user_speaking
 
     @commands.Cog.listener('on_connect')
     async def on_connect(self):
@@ -304,8 +306,8 @@ class Audio_Cog(commands.Cog):
         logger.info(f'voice_client_connected {self.voice_client.supported_modes}')
 
     async def _connect_voice(self):
-        self.bot.___custom.voice_channel = discord.utils.get(self.bot.get_all_channels(), name=self.voice_channel_title)
-        self.voice_channel = self.bot.___custom.voice_channel
+        self.bot.custom.voice_channel = discord.utils.get(self.bot.get_all_channels(), name=self.voice_channel_title)
+        self.voice_channel = self.bot.custom.voice_channel
         
         if self.voice_channel is None:
             logger.info("Voice channel not found.")
@@ -314,11 +316,9 @@ class Audio_Cog(commands.Cog):
         self.voice_client = await self.voice_channel.connect(cls=voice_recv.VoiceRecvClient)
         self.stt_sink = Speech_To_Text_Sink(
                 bot = self.bot, 
-                play_queue = self.queues.audio_out, 
-                listeners = self.listeners,
-                min_audio_len= int(self.bot.___custom.config['com_min_audio_len']),
-                end_speaking_delay= int(self.bot.___custom.config['com_end_speaking_delay']),
-                interrupt_time= int(self.bot.___custom.config['com_interrupt_time']))
+                min_audio_len= int(self.bot.custom.config['com_min_audio_len']),
+                end_speaking_delay= int(self.bot.custom.config['com_end_speaking_delay']),
+                interrupt_time= int(self.bot.custom.config['com_interrupt_time']))
         
         logger.info(f"Connected to {self.voice_channel_title}")
         self.bot.dispatch('voice_client_connected', 

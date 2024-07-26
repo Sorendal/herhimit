@@ -15,8 +15,8 @@ from typing import Union
 
 from scripts.STT_wfw import transcribe
 from scripts.discord_ext import Commands_Bot
-from utils.datatypes import Discord_Message, Halluicanation_Sentences
-from utils.utils import time_diff
+from scripts.datatypes import Discord_Message, Halluicanation_Sentences
+from scripts.utils import time_diff
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,10 @@ class STT_wfw(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
 
-        self.queues = self.bot.___custom.queues
-        self.user_speaking: set[int] = self.bot.___custom.user_speaking
-        self.user_last_message: dict[int, float] = self.bot.___custom.user_last_message
-        self.time_between_messages: float = float(self.bot.___custom.config['behavior_time_between_messages'])
-        self.host = self.bot.___custom.config['STT_host']
-        self.port = self.bot.___custom.config['STT_port']
+        self.queues = self.bot.custom.queues
+        self.time_between_messages: float = float(self.bot.custom.config['behavior_time_between_messages'])
+        self.host = self.bot.custom.config['STT_host']
+        self.port = self.bot.custom.config['STT_port']
 
         self.STT_monitor.start()
 
@@ -39,7 +37,7 @@ class STT_wfw(commands.Cog):
           removes trailing punctuation and lowercases the text.
 
           this usually happens when from silence being fed to whisper and its training data.
-          Yes, it probably was trained with youtu
+          Yes, it probably was trained with youtube
         '''
         hc = True
         text = text.strip()
@@ -77,21 +75,20 @@ class STT_wfw(commands.Cog):
 
         #check to see if the last message in the LLM queue is by the same member and update the data
             if self.queues.llm:
-                if (self.queues.llm[-1].member_id == message.member_id) and ((self.queues.llm[-1].timestamp_Audio_End - message.timestamp_Audio_End).total_seconds() < self.time_between_messages):
+                if (self.queues.llm[-1].user_id == message.user_id) and ((self.queues.llm[-1].timestamp_Audio_End - message.timestamp_Audio_End).total_seconds() < self.time_between_messages):
                     current_message = self.queues.llm[-1]
                     current_message.text += ' ' + message.text
                     current_message.timestamp_Audio_End = message.timestamp_Audio_End
                     current_message.timestamp_STT = message.timestamp_STT
                     current_message.listener_names.union(message.listener_names)
-                    current_message.listeners.union(message.listeners)
-                    logger.info(f'STT - Update LLM message {time_diff(current_message.timestamp_STT, current_message.timestamp_Audio_End)} {current_message.member} {current_message.text}')
+                    current_message.listener_ids.union(message.listener_ids)
+                    logger.info(f'STT - Update LLM message {time_diff(current_message.timestamp_STT, current_message.timestamp_Audio_End)} {current_message.user_name} {current_message.text}')
             else:
                 # new messages are added to the DB and LLM queues. 
-                message.message_id = self.bot.___custom.get_message_store_key()
                 self.queues.llm.append(message)
                 self.queues.db_message.append(message)
                 self.queues.text_message.append(message)
-                logger.info(f'STT - New LLM message {(time_diff(message.timestamp_Audio_End, message.timestamp_STT))}')#.total_seconds():.3f} {message.member} {message.text}')
+                logger.info(f'STT - New LLM message {(time_diff(message.timestamp_Audio_End, message.timestamp_STT))}')
                 
     async def cleanup(self):
         if self.STT_monitor.is_running():

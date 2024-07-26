@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 
 import wyoming.tts as wyTTS
 
-from utils.datatypes import TTS_Message, TTS_Audio
+from scripts.datatypes import TTS_Message, TTS_Audio
 from scripts.discord_ext import Commands_Bot
 
 from scripts.TTS_Piper import request_TTS
@@ -24,24 +24,17 @@ from scripts.TTS_Piper import request_TTS
 logger = logging.getLogger(__name__)
 
 class TTS(commands.Cog):
-
     def __init__(self, bot: Commands_Bot) -> None:
         self.bot: Commands_Bot = bot
         self.output_rate = DiscOpus.SAMPLING_RATE
         self.output_size = DiscOpus.FRAME_SIZE
         self.output_channels = DiscOpus.CHANNELS
-        self.queues = self.bot.___custom.queues
-        self.show_timings = self.bot.___custom.show_timings
-        self.tts_host = self.bot.___custom.config['TTS_host']
-        self.tts_port = int(self.bot.___custom.config['TTS_port'])
+        self.queues = self.bot.custom.queues
+        self.show_timings = self.bot.custom.show_timings
+        self.tts_host = self.bot.custom.config['TTS_host']
+        self.tts_port = int(self.bot.custom.config['TTS_port'])
         self.tts_monitor.start()
-    '''
-    async def process_request(self, text: str, 
-                voice: wyTTS.SynthesizeVoice,
-                alt_host: str = None,
-                alt_port: int = None) -> io.BytesIO:
-        pass
-    '''
+
     async def resample_audio(self, tts_audio: TTS_Audio):
         '''
         quick and dirty resampling and converting to stereo. Yes,

@@ -38,16 +38,16 @@ Configuration - expected in the .env config
         2 - NSFW - LLM is instructed to respond as an adult and can be lewd
         3 - NSFW - LLM is instructed to respond as an adult and will be lewd
     LLM_speaker_pause_time - time to pause between speakers in ms.
-    LLM_message_history_privacy - Work in progress, currently implemented to filter history
-        for messages anyone in the room has listened to. 
-            
-        Should be fairly easy to not filter anything, but the context lenght will limit
-            previous conversations.
-        Should be fairly easy to filter out any messages so only those that all current 
-            members of the channel have heard are sent to the LLM.
+    LLM_message_history_privacy - what information the bot has when crafting a response. 
+        It might be gosspy, but it might not be. Levels 3 and 4 might be a little too
+        restrictive (i.e. a new user hops in a quiet channel and talks and the bot is
+        responds to the 1st message as if they are talking to themselves).
+        0 - all history
+        1 - only what any listeners have heard 
+        2 - only what all listeners has heard (default)
+        3 - only what any speakers have heard 
+        4 - only what all speakers have heard 
         
-        The bot may be a gossip and repeat stuff that a user who is not logged in has said.
-
     behavior_track_text_interrupt : bool. If you want the message interrupts to be tracked.
         LLMs might figure out the interrupts are happening as their text messages are modified
         with (InterruptingUserName)~~SentencesInterrupted~~, and might get snarky about it. 
@@ -57,98 +57,155 @@ Configuration - expected in the .env config
     LLM_prompt_format: see the LLM_prompts.py for more info.
 
 '''
-import logging
+import logging, asyncio
 from datetime import datetime
 from typing import DefaultDict, Union
 from collections import deque
 
-from .datatypes import Discord_Message, Speaking_Interrupt
-from .LLM_interface import LLM_Interface
-from .LLM_prompts import LLM_Prompts
-from .utils import strip_non_alphanum
+from scripts.datatypes import Discord_Message, Speaking_Interrupt, CTR_Reasoning
+from scripts.LLM_interface import LLM_Interface
+from scripts.LLM_prompts import LLM_Prompts, Assistant_Prompt, System_Prompt, CTR_Prompt, Prompt_SUA
+from scripts.utils import strip_non_alphanum
 
 logger = logging.getLogger(__name__)
 
-sentence_seperators = ['.', '?', '\n', '!']
-
-
-class Bot_LLM(LLM_Interface):
+class Bot_LLM():
     
     def __init__(self, 
-                  host: int,
-                 port: str,
-                 llm_model: str,
-                 api_key: str,
-                 context_length: int,
-                 server_type: str,
-                 SFW: int,
-                 message_store: dict[int, Discord_Message],
-                 disc_user_messages: dict[int, Discord_Message],
-                 message_history_privacy: int,
-                 bot_name: int,
-                 prompt_format: str,
-                 max_response_tokens: int,
-                 config: dict,
-                 temperature: float = 0.7, ) -> None:
-        #LLM_Prompts.__init__(self)
-        self.host = host
-        self.port = port
-        super().__init__(llm_uri = f'http://{self.host}:{self.port}',
-                llm_model = llm_model, server_type=server_type,
-                temperature = temperature, context_length = int(context_length),
-                max_response_tokens=int(max_response_tokens))
-
-        self.api_key = api_key
+                    config: dict, 
+                    message_store: dict, 
+                    message_listened_to: dict,
+                    bot_name: str,
+                    bot_id: int):
         
-        self.message_store: DefaultDict[int, Discord_Message] = message_store        
-        self.discord_user_messages: DefaultDict[int, set[int]] = disc_user_messages
+        self.llm = LLM_Interface(config)
+        self.prompts = LLM_Prompts(bot_name=bot_name,
+                        model_prompt_template=config["LLM_prompt_format"],
+                        SFW=config["LLM_SFW"])
 
+        self.message_store: DefaultDict[int, Discord_Message] = message_store        
+        self.message_listened_to: DefaultDict[int, set[int]] = message_listened_to
+        
+        self.bot_name = bot_name
+        self.bot_id = bot_id
+
+        #message tracking
         self.last_bot_message: int = 0
-        self.bot_id: int = None
+        self.message_id_high: int = 0
+        self.message_id_low : int = -1
+
+        self.bot_id: int = bot_id
         self.bot_name: str = bot_name
-        self.SFW  : bool = SFW
-        self.message_history_privacy: int = message_history_privacy
+
+        self.message_history_privacy: int = config['LLM_message_history_privacy']
 
         self.voice_model: str = 'en_GB-vctk-medium'
         self.voice_number: int = 8
 
-        self.prompts = LLM_Prompts(SFW=SFW, 
-                model_prompt_template=prompt_format)
+        self.tokens_chat = ((int(config['LLM_context_length']) * 3) // 4)
+        self.tokens_chat_response = int(config['LLM_token_response'])
+        self.tokens_thoughts = self.tokens_chat // 3
+        self.tokens_thoughts_response = self.tokens_chat_response // 2
 
-        self.max_response_tokens = int(max_response_tokens)
-        self.bot_personality: str = self.prompts.jade
         self.stop_generation: bool = False
-        self.prompt_format: str = prompt_format
-        self.get_tokens = []
 
-    def store_message(self, message: Discord_Message, 
-                      message_id: int = None, 
+        self.get_token_queue = deque()
+
+    def get_ctr_prompts(self, 
+                    disc_messages: list[Discord_Message],
+                    ctr_prompt: CTR_Prompt,
+                    assistant_prompt: Assistant_Prompt) -> Prompt_SUA:
+
+        available_tokens = self.tokens_thoughts - self.tokens_thoughts_response 
+        available_tokens -= assistant_prompt.tokens - ctr_prompt.ctr_tokens
+
+        asstiant_str = assistant_prompt.gen()
+        cur_time = datetime.now()
+        new_messages = []
+        user_ids = set()
+        listener_ids = set()
+        listener_names = set()
+
+        for message in disc_messages:
+            user_ids.add(message.user_id)
+            for id in message.listener_ids:
+                listener_ids.add(id)
+            for name in message.listener_names:
+                listener_names.add(name)
+            new_messages.append(self.prompts.get_formatted_message(
+                message = message,
+                current_time = cur_time,
+                prompted = True))
+            if message.prompt_tokens:
+                available_tokens -= message.prompt_tokens
+            else:
+                available_tokens -= len(new_messages[-1]) // 4
+
+        history = self.get_message_history(
+                user_ids=user_ids,
+                listener_ids=listener_ids,
+                max_tokens=available_tokens,
+                current_time=cur_time,
+                prompted=False)
+
+        ctr_str = ctr_prompt.gen(listener_names, history)
+
+        prompts = Prompt_SUA({
+                "system": ctr_str,
+                "user": "\n".join(new_messages),
+                "assistant": asstiant_str
+                })
+
+        return prompts
+
+    async def make_a_choice_to_respond(self, 
+                disc_messages: list[Discord_Message],
+                ctr_prompt: CTR_Prompt,
+                assistant_prompt: Assistant_Prompt) -> CTR_Reasoning:
+
+        prompts = self.get_ctr_prompts(disc_messages=disc_messages, 
+                ctr_prompt=ctr_prompt, 
+                assistant_prompt=assistant_prompt)
+
+        response = await self.llm.generate(
+                prompts = prompts,
+                output_class=CTR_Reasoning,
+                raw=True)
+
+        return response
+
+    def store_message(self, messages: Union[list[Discord_Message]|Discord_Message], 
                       prepend: bool=False):
         '''
-        Stores a message in the message store. If no message_id is provided, it will be assigned one.
-         If prepend is True, the message will be added to the beginning of the message store.
+        Stores a message in the message store. 
+        If prepend is True, the message will be added to the beginning of the message store.
         '''
+        if type(messages) != list:
+            messages: list[Discord_Message] = [messages]
 
-        if message.member_id not in self.discord_user_messages.keys():
-            self.discord_user_messages[message.member_id] = set()
+        min_key = self.message_id_low        
+        max_key = self.message_id_high
 
-        if len(self.message_store) == 0:
-            message.message_id = 1
-        elif prepend:
-            message.message_id = min(self.message_store.keys()) - 1
-        elif not message.message_id:
-            message.message_id = max(self.message_store.keys()) + 1
-        
-        self.message_store[message.message_id] =(message)
-        
-        for listener in message.listeners:
-            if listener not in self.discord_user_messages.keys():
-                self.discord_user_messages[listener] = set()
-                self.discord_user_messages[listener].add(message.message_id)
+        for message in messages:
+            if message.prompt_tokens is None:
+                if not message in self.get_token_queue:
+                    self.get_token_queue.append(message)
+            if not message.user_id in self.message_listened_to.keys():
+                self.message_listened_to[message.user_id] = set()
+            if prepend:
+                min_key -= 1
+                message.message_id = min_key
             else:
-                self.discord_user_messages[listener].add(message.message_id)
+                max_key += 1
+                message.message_id = max_key
+            self.message_store[message.message_id] = message
+            for listener in message.listener_ids:
+                if listener not in self.message_listened_to.keys():
+                    self.message_listened_to[listener] = set()
+                self.message_listened_to[listener].add(message.message_id)
 
-        #self.last_message = message.message_id
+        self.message_id_high = max_key
+        self.message_id_low = min_key
 
     def interupt_sentences(self, interrupt: Speaking_Interrupt) -> Discord_Message:
         '''
@@ -175,69 +232,76 @@ class Bot_LLM(LLM_Interface):
         message.text = ' '.join(message.sentences)
         return self.message_store[self.last_bot_message]
 
-    def get_member_message_history(self, member_id: int = None, 
-                member_ids: set[int] = None, 
-                max_tokens: int = 16768,
-                current_time: datetime = None, prompted = False) -> str:
+    def _get_message_history_keys(self, 
+                    user_ids: set[int], 
+                    listener_ids: set[int], 
+                    ignore_keys: set[int] = None) -> list[int]:
+        '''
+        Helper function for get_message_history. Returns a sorted 
+        list of keys that are in the message store and
+        not in the ignore_keys set. Respects privacy settings.
+        '''
+        for id in user_ids:
+            if id not in self.message_listened_to:
+                self.message_listened_to[id] = set()
+
+        keyset = set()
+
+        if self.message_history_privacy == 0:
+            keyset.update(self.message_store.keys())
+        elif self.message_history_privacy == 1:
+            keyset |= {element for id in listener_ids for element in self.message_listened_to[id]}
+        elif self.message_history_privacy == 2:
+            keyset &= {element for id in listener_ids for element in self.message_listened_to[id]}
+        elif self.message_history_privacy == 3:
+            keyset |= {element for id in user_ids for element in self.message_listened_to[id]}
+        elif self.message_history_privacy == 4:
+            keyset &= {element for id in user_ids for element in self.message_listened_to[id]}
+
+        if ignore_keys != None:
+            keyset - ignore_keys
         
-        member_history = ""
+        keylist = list(keyset)
+        keylist.sort(reverse=True)
+
+        return keylist
+
+    def get_message_history(self, 
+                user_ids: set[int], 
+                listener_ids: set[int], 
+                max_tokens: int, 
+                current_time: datetime = None, 
+                prompted:bool = False,
+                ignore_messages: set[int] = None) -> list[str]:
+
+        keylist = self._get_message_history_keys(user_ids, 
+                    listener_ids, ignore_messages)
+        
+        member_history = []
         tokens = 0
+    
         if not current_time:
             current_time = datetime.now()
 
-        if not member_ids and member_id:
-            member_ids = [member_id]
-        else:
-            member_id = list(member_ids)
+        for message_id in keylist:
+            message = self.message_store[message_id]
+            output_str = self.prompts.get_formatted_message(
+                    message=message,
+                    current_time=current_time,
+                    prompted=prompted)
+            if message.prompt_tokens == None:
+                self.get_token_queue(Discord_Message)
+                tokens += (message.prompt_end + message.prompt_end) // 4
+            else:
+                tokens += message.prompt_tokens
+            if tokens > max_tokens:
+                break
+            member_history.append(output_str)
 
-        #multiple users message history with messages listend to
-        if member_ids:
-            keyset = set()
-            for id in member_ids:
-                if id not in self.discord_user_messages.keys():
-                    self.discord_user_messages[id] = set()
-                keyset.update(self.discord_user_messages[id])
-            keylist = sorted(keyset)
-            #keylist.reverse()
-            for message_id in keylist:
-                message = self.message_store[message_id]
-                output_str = self.prompts.get_formatted_message(
-                        message=message,
-                        current_time=current_time,
-                        prompted=prompted)
-                if message.prompt_tokens == None:
-                    self.get_tokens.append(Discord_Message)
-                    #self.queue_get_tokens.append(message.message_id)
-                #tokens += message.prompt_tokens
-                #if tokens > max_tokens:
-                #    break
-                member_history += (output_str+'\n')
-                
-        #print(f"{' '.join(member_history)}")
+        member_history = reversed(member_history)
         return member_history
         
     def process_sentences(self, sentence: str, previous_sentences: list[str]) -> str:
-        if len(previous_sentences) == 0:
-            sentence = self.format_sentences(
-                sentence=sentence, previous_sen=(
-                    '', 
-                    ''))
-        elif len(previous_sentences) == 1:
-            sentence = self.format_sentences(
-                sentence=sentence, 
-                previous_sen=(
-                    previous_sentences[-1],
-                    ''))
-        if len(previous_sentences) > 1:
-            sentence = self.format_sentences(
-                sentence=sentence, 
-                previous_sen=(
-                    previous_sentences[-1],
-                    previous_sentences[-2]))
-        return sentence
-
-    def format_sentences(self, sentence: str, 
-                previous_sen: tuple[str, str]) -> Union[str, None]:
         '''
         previous_sen is a tuple of 2 elements for formatting reponses. 
         
@@ -248,6 +312,8 @@ class Bot_LLM(LLM_Interface):
         This function removes the bots name and fake timestamp from the 
         response.
         '''
+        num_previous = min(2, len(previous_sentences))  # limit to last two sentences
+        previous_sen = ('', '') if not previous_sentences else tuple(previous_sentences[-num_previous:])
         # Check for repitition of newlines and return None if there 
         # are more than 2 in a row.
         if sentence == '\n':
@@ -265,7 +331,7 @@ class Bot_LLM(LLM_Interface):
             if bot_name_loc != -1 and bot_name_loc < 4:
                 sentence = sentence[len(self.bot_name)+bot_name_loc:]
             # Check for a timestamp pattern at the beginning of the 
-            # sentence
+            # sentence example 2 minutes, 26 seconds 
             time_endings = ('day', 'hour', 'minute', 'second')
             word_len = 0
             time_loc = 0
@@ -287,72 +353,80 @@ class Bot_LLM(LLM_Interface):
                                         suffix=sentence[-1])
         return sentence
     
-    async def wmh_stream_sentences(self, messages: list[Discord_Message],
-            response: Discord_Message, display_history: bool = False):
-
-        system_prompt = self.prompts.system.gen(name= self.bot_name, 
-                chat_prompt=self.prompts.system_str_personality,
-                personality=self.bot_personality)
-
-        user_prompt = ''
-
-        if not self.prompts.system.tokens:
-            self.prompts.system.tokens = await self.get_num_tokens(system_prompt)
-
-        avaible_tokens = self.context_length - self.max_response_tokens - self.prompts.system.tokens
-        sentence_seperators = ['.', '?', '\n', '!']
-
-        
+    def get_wmh_prompts(self,messages: Union[list[Discord_Message]|Discord_Message],
+            response: Discord_Message, 
+            system_prompt:System_Prompt, 
+            assistant_prompt:Assistant_Prompt,
+            display_history: bool = False) -> Prompt_SUA:
+        """
+        Get the prompts for the wmh streaming.
+        """
         current_time = datetime.now()
+        #print(messages)
+        avaible_tokens = self.tokens_chat - self.tokens_chat_response
+        avaible_tokens -= self.prompts.system.tokens - self.prompts.assistant.tokens
+        new_messages = ""
+
+        user_ids = set()
+
+        if type(messages) != list:
+            messages:list[Discord_Message] = [messages]
 
         for message in messages:
+            user_ids.add(message.user_id)
+            response.listener_ids.update(message.listener_ids)
+            response.listener_names.update(message.listener_names)
+            #self.store_message(message)
+            new_messages += self.prompts.get_formatted_message(message, current_time, prompted=True) + '\n'
 
-            if not response.listeners:
-                response.listeners = message.listeners.copy()
-            else:
-                response.listeners.union(message.listeners)
+        assistant_str = assistant_prompt.gen()
+        system_str = system_prompt.gen(listener_names=response.listener_names)
 
-            if not response.listener_names:
-                response.listener_names = message.listener_names.copy()
-            else:
-                response.listener_names.union(message.listener_names)
-
-            cur_prompt = self.prompts.get_formatted_message(
-                    message = message,
-                    current_time = current_time,
-                    prompted=True)
-
-            if message.prompt_tokens == 0:
-                self.get_tokens.append(message)
-                avaible_tokens -= len(cur_prompt) // 4
-            else:
-                avaible_tokens -= message.prompt_tokens
-
-        user_prompt = self.get_member_message_history(
-                member_ids = response.listeners,
+        prompt_list = '\n'.join(self.get_message_history(
+                listener_ids = response.listener_ids,
+                user_ids=user_ids,
                 max_tokens=avaible_tokens, 
-                current_time=current_time, prompted=True) + user_prompt
+                current_time=current_time, prompted=True)) + '\n' + new_messages
+        print(prompt_list)
+        
+        results = Prompt_SUA({
+            'system': system_str,
+            'assistant': assistant_str,
+            'user': '\n'.join(prompt_list)
+            })
 
-        for message in messages:
-            self.store_message(message=message)
-
-        assistant_prompt = self.prompts.assistant.gen(name=self.bot_name)
-        response.sentences = [] 
-        # stupid mutibale varible shared between all instances of the class.
         if display_history:
-            print('---------------------------------------------------------')
-            print(f'{system_prompt}\n\n{user_prompt}\n\n{assistant_prompt}')
-            print()
+            logger.info(f'{"*-"*25}*\n{system_str}{results["user"]}{assistant_str}\n{"*-"*25}*')
+
+        return results
+    
+    async def wmh_stream_sentences(self, 
+                messages: list[Discord_Message],
+                bot_response_mesg: Discord_Message, 
+                system_prompt:System_Prompt, 
+                assistant_prompt:Assistant_Prompt,
+                display_history: bool = False):
+
+        prompts = self.get_wmh_prompts(messages = messages, 
+                        response=bot_response_mesg, 
+                        system_prompt=system_prompt, 
+                        assistant_prompt=assistant_prompt,
+                        display_history=display_history)
+
+        if self.llm.stop_generation:
+            await asyncio.sleep(0.1)
+            self.llm.stop_generation = False
+            return
+
 
         try:
+            sentence_seperators = ['.', '?', '\n', '!']        
             sentence:str = ''
-            async for chunk_undecoded in self.stream(
-                        system=system_prompt, 
-                        user=user_prompt, 
-                        assistant=assistant_prompt):
+            async for chunk_undecoded in self.llm.stream(prompts=prompts):
                 #chunk = self.process_chunk(chunk)
-                if self.stop_generation == True:
-                    self.stop_generation = False
+                if self.llm.stop_generation == True:
+                    await asyncio.sleep(0.1)
+                    self.llm.stop_generation = False
                     break
                 chunk = chunk_undecoded#= self.decode_chunk(chunk_undecoded)
                 if chunk not in sentence_seperators:
@@ -361,21 +435,22 @@ class Bot_LLM(LLM_Interface):
                     sentence += chunk
                     sentence = self.process_sentences(
                         sentence=sentence,
-                        previous_sentences=response.sentences
+                        previous_sentences=bot_response_mesg.sentences
                         )
                     if sentence is not None:
                         if sentence != '':
                             if len(sentence) > 0:
-                                response.sentences.append(sentence)
+                                bot_response_mesg.sentences.append(sentence)
                                 yield sentence
                     sentence = ''
         finally:
+            #update time
             current_time = datetime.now()
-            response.text = ' '.join(response.sentences)
-            response.timestamp_creation = current_time
-            response.timestamp_LLM = current_time
-            self.store_message(response)
-            self.last_bot_message =response.message_id
+            bot_response_mesg.text = ' '.join(bot_response_mesg.sentences)
+            bot_response_mesg.timestamp = current_time
+            bot_response_mesg.timestamp_LLM = current_time
+            self.store_message(messages)
+            self.store_message(bot_response_mesg)
+            self.last_bot_message =bot_response_mesg.message_id
             for message in messages:
-                message.reponse_message_id = response.message_id
-
+                message.reponse_message_id = bot_response_mesg.message_id

@@ -30,7 +30,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 from sqlalchemy.sql import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession, AsyncAttrs
 
-from utils.datatypes import Discord_Message, DB_InOut, Cog_User_Info
+from scripts.datatypes import Discord_Message, DB_InOut, Cog_User_Info
 
 str_255 = Annotated[str, mapped_column(String(255))]
 str_10 = Annotated[str, mapped_column(String(10))]
@@ -55,8 +55,8 @@ class Base(DeclarativeBase, AsyncAttrs):
 
 class Users(Base):
     __tablename__ = 'Users'
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, unique=True)
-    name: Mapped[str_255]
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, unique=True)
+    user_name: Mapped[str_255]
     global_name: Mapped[Optional[str_255]]
     display_name: Mapped[Optional[str_255]]
     real_name: Mapped[Optional[str_255]]
@@ -70,11 +70,11 @@ class Users(Base):
 class Messages(Base):
     __tablename__ = 'Messages'  # table name
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.id'))
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.user_id'))
     text: Mapped[str] = mapped_column(Text, nullable=False)
     text_corrected: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     text_interrupted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    timestamp_creation: Mapped[datetime] = mapped_column(DATETIME(2))
+    timestamp: Mapped[datetime] = mapped_column(DATETIME(2))
     tokens: Mapped[int]
     prompt_type: Mapped[str_10]
     discord_message_id: Mapped[BigInteger] = mapped_column
@@ -84,7 +84,7 @@ class Messages(Base):
 class UserLog(Base):
     __tablename__ = 'UserLog'
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.id'))
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.user_id'))
     timestamp_in: Mapped[datetime]
     timestamp_out: Mapped[Optional[datetime]]
     user: Mapped['Users'] = relationship(back_populates='logs', lazy='selectin')
@@ -93,13 +93,14 @@ class UserInfo(Base):
     __tablename__ = 'UserInfo'
     id: Mapped[int] = mapped_column(primary_key= True)
     text: Mapped[Optional[str]] = mapped_column(Text)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.id'))
+    bot_thoughts: Mapped[Optional[str]] = mapped_column(Text)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.user_id'))
     user: Mapped['Users'] = relationship(back_populates='info', lazy='joined')
 
 class MessageListeners(Base):
     __tablename__ = 'MessageListeners'  # table name
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.id'))
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('Users.user_id'))
     message_id: Mapped[int] = mapped_column(ForeignKey('Messages.id'))
     user: Mapped['Users'] = relationship(back_populates='messages_listened', lazy='selectin')
     message: Mapped['Messages'] = relationship(back_populates='listeners', lazy='selectin')
@@ -177,8 +178,8 @@ class SQL_Interface_Base():
                 #permissions = {}
                 if user is None:
                     user = Users(
-                        id  = disc_member.member_id,
-                        name = disc_member.name.capitalize(),
+                        user_id  = disc_member.member_id,
+                        user_name = disc_member.name.capitalize(),
                         bot = disc_member.bot,
                         display_name = disc_member.display_name,
                         global_name = disc_member.global_name,
@@ -188,11 +189,11 @@ class SQL_Interface_Base():
                     await session.commit()
                     return True
                 else:
-                    if user.name != disc_member.name:
-                        response['change_old_name'] = user.name
+                    if user.user_name != disc_member.name:
+                        response['change_old_name'] = user.user_name
                         response['change_new_name'] = disc_member.name
                         if disc_member.name:
-                            user.name = disc_member.name
+                            user.user_name = disc_member.name
                     if user.display_name != disc_member.display_name:
                         response['change_old_display_name'] = user.display_name
                         response['change_new_display_name'] = disc_member.display_name
@@ -225,12 +226,12 @@ class SQL_Interface_Base():
                 for login in logins:
                     if login['in_time'] is None or login['out_time'] is None:
                         continue
-                    user = await session.get(Users, login['member_id'])
+                    user = await session.get(Users, login['user_id'])
                     #logger.info(f'record loginout - user - {user}')
                     if user is None:
-                        logger.info(f'User {login["member_id"]} not found in database')
+                        logger.info(f'User {login["user_id"]} not found in database')
                         continue
-                    new_login = UserLog(user_id = user.id, 
+                    new_login = UserLog(user_id = user.user_id, 
                             timestamp_in = login['in_time'],
                             timestamp_out = login['out_time'])
                     session.add(new_login)
@@ -238,7 +239,7 @@ class SQL_Interface_Base():
                 await session.commit()
                 return True
 
-    async def login_user(self, member_id: int):
+    async def login_user(self, user_id: int):
         '''
         login the user with a timestamp, if they are not already logged in by
         checking checking timestamp_out and create a new login by adding a new 
@@ -246,23 +247,23 @@ class SQL_Interface_Base():
         '''
         async with self.factory() as session:
             async with session.begin():
-                user = await session.get(Users, member_id)
+                user = await session.get(Users, user_id)
                 if not user.logs:
-                    session.add(UserLog(user_id=user.id, timestamp_in=datetime.now()))
+                    session.add(UserLog(user_id=user.user_id, timestamp_in=datetime.now()))
                 elif user.logs[-1].timestamp_out:
-                    session.add(UserLog(user_id=user.id, timestamp_in=datetime.now()))
+                    session.add(UserLog(user_id=user.user_id, timestamp_in=datetime.now()))
                 elif user.logs[-1].timestamp_out is not None:
-                    session.add(UserLog(user_id=user.id))
+                    session.add(UserLog(user_id=user.user_id))
                     await session.commit()
 
-    async def logout_user(self, member_id: int):
+    async def logout_user(self, user_id: int):
         '''
         log out user with a timestamp. the all parameter is used during
         the cleanup method
         '''
         async with self.factory() as session:
             async with session.begin():
-                user = await session.get(Users, member_id)
+                user = await session.get(Users, user_id)
                 if user is None:
                     raise Exception('No such user exists in the database.')
                 
@@ -283,38 +284,38 @@ class SQL_Interface_Base():
                 query_users: dict[int, Users] = {}
                 for disc_message in disc_messages:
                     # retreive users from the database
-                    user = await session.get(Users, disc_message.member_id)
+                    user = await session.get(Users, disc_message.user_id)
                     if user is None:
                         raise Exception('No such user exists in the database on message creation.')
-                    if disc_message.member_id not in query_users:
-                        query_users[disc_message.member_id] = user
-                    for listener in disc_message.listeners:
+                    if disc_message.user_id not in query_users:
+                        query_users[disc_message.user_id] = user
+                    for listener in disc_message.listener_ids:
                         queried_listener = await session.get(Users, listener)
                         if queried_listener is None:
                             raise Exception('No such user exists in the database on message creation.')
                         if listener not in query_users:
                             query_users[listener] = queried_listener
                 for disc_message in disc_messages:
-                    query_users[disc_message.member_id].messages.append(Messages(
+                    query_users[disc_message.user_id].messages.append(Messages(
                         text = disc_message.text, 
                         text_corrected = disc_message.text_llm_corrected,
                         text_interrupted = disc_message.text_user_interrupt,
-                        tokens = disc_message.tokens,
+                        tokens = disc_message.prompt_tokens,
                         prompt_type = disc_message.prompt_type,
-                        timestamp_creation = disc_message.timestamp_creation,
+                        timestamp = disc_message.timestamp,
                         ))
                     await session.flush()
-                    for listener in disc_message.listeners:
+                    for listener in disc_message.listener_ids:
                         if listener not in query_users.keys():
                             raise Exception('No such user exists in the database on message creation.')
                         session.add(MessageListeners(
-                            user_id = query_users[listener].id,
-                            message_id=query_users[disc_message.member_id].messages[-1].id))
+                            user_id = query_users[listener].user_id,
+                            message_id=query_users[disc_message.user_id].messages[-1].id))
                 await session.commit()
                 for disc_message in disc_messages:
                     disc_message.stored_in_db = True
 
-    async def get_message_history(self, member_id: int, 
+    async def get_message_history(self, user_id: int, 
                     max_tokens: int = 32768) -> dict[datetime, Discord_Message]:
         '''
         get a user history of total tokens, return a dict with a 
@@ -325,7 +326,7 @@ class SQL_Interface_Base():
                 total_tokens = 0
                 message_history: dict[float, Discord_Message] = {}
                 
-                user = await session.get(Users, member_id)
+                user = await session.get(Users, user_id)
                 if user.messages_listened is None:
                     return None
 
@@ -336,18 +337,18 @@ class SQL_Interface_Base():
                     await session.refresh(message_listened_to.message.user)
 
                     current_message = Discord_Message(
-                            member_id = message_listened_to.message.user.id,
-                            member =    message_listened_to.message.user.name,
+                            user_id = message_listened_to.message.user.user_id,
+                            member =    message_listened_to.message.user.user_name,
                             text =      message_listened_to.message.text,
                             tokens =    message_listened_to.message.tokens,
-                            timestamp_creation = message_listened_to.message.timestamp_creation,
+                            timestamp = message_listened_to.message.timestamp,
                             listeners = [listener.user_id for listener in message_listened_to.message.listeners],
-                            listener_names = [listener.user.name for listener in message_listened_to.message.listeners],
+                            listener_names = [listener.user.user_name for listener in message_listened_to.message.listeners],
                             stored_in_db=True
                         )
 
-                    message_history[current_message.timestamp_creation] = current_message
-                    total_tokens += current_message.tokens
+                    message_history[current_message.timestamp] = current_message
+                    total_tokens += current_message.prompt_tokens
                     if total_tokens > max_tokens:
                         break
                 if message_history.items() == 0:

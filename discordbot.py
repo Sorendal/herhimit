@@ -72,8 +72,8 @@ from discord.ext import commands, tasks
 
 from scripts.discord_ext import Commands_Bot
 
-from utils.datatypes import Discord_Message
-from utils.utils import time_diff
+from scripts.datatypes import Discord_Message
+from scripts.utils import time_diff
 
 config = dotenv_values('.env')
 
@@ -104,20 +104,20 @@ things to check
 class TextInterface(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
-        self.text_channel_title = self.bot.___custom.config['client_text_channel']
-        self.track_interrupt = bool(self.bot.___custom.config['behavior_track_text_interrupt'])
-        self.bot.___custom.show_timings = bool(self.bot.___custom.config['performance_show_timings'])
-        self.bot.___custom.show_text = bool(self.bot.___custom.config['performance_show_text'])
-        self.bot.___custom.TTS_enable = bool(self.bot.___custom.config['behavior_TTS_enable'])
-        self.bot.___custom.db_always_connected = bool(self.bot.___custom.config['performance_db_always_connected'])
-        self.show_timings = self.bot.___custom.show_timings
-        self.text_channel: discord.TextChannel = None
+        self.text_channel_title = self.bot.custom.config['client_text_channel']
+        self.track_interrupt = bool(self.bot.custom.config['behavior_track_text_interrupt'])
+        self.bot.custom.show_timings = bool(self.bot.custom.config['performance_show_timings'])
+        self.bot.custom.show_text = bool(self.bot.custom.config['performance_show_text'])
+        self.bot.custom.tts_enable = bool(self.bot.custom.config['behavior_TTS_enable'])
+        self.bot.custom.db_always_connected = bool(self.bot.custom.config['performance_db_always_connected'])
+        self.show_timings = self.bot.custom.show_timings
+        self.text_channel: discord.TextChannel = self.bot.custom.text_channel
         self.authorized_roles: dict[int, str] = {}
         self.last_message: dict[int, int] = {}
         self.monitor_loop_count: int = 0
-        self.id_member_name: dict[int, str] = self.bot.___custom.current_listeners
-        self.user_speaking: set[int] = self.bot.___custom.user_speaking
-        self.queues = self.bot.___custom.queues
+        self.id_member_name: dict[int, str] = self.bot.custom.current_listeners
+        self.user_speaking: set[int] = self.bot.custom.user_speaking
+        self.queues = self.bot.custom.queues
         self.display_logs_queue: bool = False
 
     @tasks.loop(seconds=0.1)
@@ -172,7 +172,7 @@ class TextInterface(commands.Cog):
     
     async def process_text_message(self, message: Discord_Message):
         if self.show_timings:
-            if self.bot.___custom.show_text:
+            if self.bot.custom.show_text:
                 logging.info(self.report_text_info(disc_message=message))
         # edited message
         if message.text_llm_corrected or message.text_user_interrupt:
@@ -183,10 +183,10 @@ class TextInterface(commands.Cog):
                 elif message.text_user_interrupt:
                     await disc_message.edit(content=f'{message.text}')
             except discord.errors.HTTPException:
-                if message.discord_retry == 2:
+                if message.discord_text_retry == 2:
                     logging.info("Max retries exceeded for editing the message. Discarding message")
                 else:
-                    message.discord_retry += 1
+                    message.discord_text_retry += 1
                     logging.info(f"An HTTP exception occurred while fetching or editing message")
                     self.queues.text_message.appendleft(message)                
             except discord.NotFound:
@@ -196,18 +196,18 @@ class TextInterface(commands.Cog):
         #new message
         else:
             output_text = ''
-            if message.member_id == self.bot.user.id:
+            if message.user_id == self.bot.user.id:
                 output_text = message.text
             else:
-                output_text = f':{message.member}: {message.text}'
+                output_text = f':{message.user_name.capitalize()}: {message.text}'
             try:    
                 disc_message = await self.text_channel.send(output_text)
                 message.discord_text_message_id = disc_message.id
             except discord.errors.HTTPException:
-                if message.discord_retry == 2:
+                if message.discord_text_retry == 2:
                     logging.info(f"An HTTP exception occurred while sending message - Max retrys - Discarding message")
                 else:
-                    message.discord_retry += 1
+                    message.discord_text_retry += 1
                     self.queues.text_message.appendleft(message)                
                     logging.info(f"An HTTP exception occurred while sending message")
             except discord.Forbidden:
@@ -215,14 +215,14 @@ class TextInterface(commands.Cog):
 
     def report_text_info(self, disc_message: Discord_Message) -> str:
         output_text = ''
-        if self.bot.___custom.show_text:
+        if self.bot.custom.show_text:
             if disc_message.text:
                 output_text += f'Text: {disc_message.text} '
             if disc_message.text_llm_corrected:
                 output_text += f'LLM Corrected Text: {disc_message.text_llm_corrected} '
             if disc_message.text_user_interrupt:
                 output_text += f'User Interrupted Text: {disc_message.text_user_interrupt} '
-        if self.bot.___custom.show_timings and self.bot.___custom.show_text:
+        if self.bot.custom.show_timings and self.bot.custom.show_text:
             output_text += '\n'
         if self.show_timings:
             if disc_message.timestamp_STT:
@@ -336,6 +336,8 @@ class TextInterface(commands.Cog):
         await ctx.send('Bye!')
         await bot.close()
 
+    '''
+    not implmented yet
     @commands.command()
     async def callme(self, ctx: commands.context.Context, name: str):
         """
@@ -346,12 +348,20 @@ class TextInterface(commands.Cog):
         else:
             self.bot.dispatch('update_username', name=name)
             await ctx.send('I will call you ' + name)
-    
+    '''
+
     @commands.command()
-    async def log(self, ctx: commands.context.Context, arg1: str):
+    async def log(self, ctx: commands.context.Context, arg1: str, arg2: str = None):
+        '''
+        toggles to display info to the log
+
+        q - show queues
+        pgen - show prompt generation
+        mh - show message history - very, very spammy - basically debug
+        text - show text generation
+        '''
         if not self.check_auth(ctx):
             await ctx.send("You are not authorized to use this command.", delete_after=5)
-        # enable log to show queues
         elif arg1 == 'q':
             if self.display_logs_queue:
                 self.display_logs_queue = False
@@ -359,47 +369,57 @@ class TextInterface(commands.Cog):
             else:
                 self.display_logs_queue = True
                 await ctx.send("Log queue enabled.")
-        # enable log to show message history
-        elif arg1 == 'mh':
-            if self.bot.___custom.display_message_history == True:
-                self.bot.___custom.display_message_history = False
+        elif arg1 == 'pgen':
+            if self.bot.custom.display_message_history == True:
+                self.bot.custom.display_message_history = False
                 await self.text_channel.send('Message history disabled.', delete_after=5)
             else:
-                self.bot.___custom.display_message_history = True
+                self.bot.custom.display_message_history = True
                 await self.text_channel.send('Message history enabled.', delete_after=5)
-
+        elif arg1 == 'text':
+            if self.bot.custom.show_text:
+                self.bot.custom.show_text = False
+                await ctx.send(f"Text logging is now disabled.", delete_after=5)
+            else:
+                self.bot.custom.show_text = True
+                await ctx.send("Text logging is now enabled.", delete_after=5)
+        else:
+            await ctx.message.delete()
         #delete the sent message
         await ctx.message.delete(delay=5)
 
     @commands.command()
-    async def toggle(self, ctx: commands.context.Context, arg1):
+    async def toggle(self, ctx: commands.context.Context, arg1, *args):
         '''toggles options 
             db = db_always_connected
-            text = show text in log
+            tts 
+            response - sub command
+                ctr - shows a message as to why the bot choose to not respond
         '''
         if not self.check_auth(ctx):
             await ctx.send("You are not authorized to use this command.", delete_after=5)
         elif arg1 == 'db':
-            if self.bot.___custom.db_always_connected:
-                self.bot.___custom.db_always_connected = False
+            if self.bot.custom.db_always_connected:
+                self.bot.custom.db_always_connected = False
                 await ctx.send("DB connection will disconnect when not idle.", delete_after=5)
             else:
-                self.bot.___custom.db_always_connected = True
+                self.bot.custom.db_always_connected = True
                 await ctx.send("DB connection will stay connected.", delete_after=5)
-        elif arg1 == 'text':
-            if self.bot.___custom.show_text:
-                self.bot.___custom.show_text = False
-                await ctx.send(f"Text logging is now disabled.", delete_after=5)
-            else:
-                self.bot.___custom.show_text = True
-                await ctx.send("Text logging is now enabled.", delete_after=5)
         elif arg1 == 'tts':
-            if self.bot.___custom.TTS_enable:
-                self.bot.___custom.TTS_enable = False
+            if self.bot.custom.tts_enable:
+                self.bot.custom.tts_enable = False
                 await ctx.send("TTS is now disabled.", delete_after=5)
             else:
-                self.bot.___custom.TTS_enable = True
+                self.bot.custom.tts_enable = True
                 await ctx.send("TTS is now enabled.", delete_after=5)
+        elif arg1 == 'response':
+                if args[0] == 'ctr':
+                    if self.bot.custom.show_choice_to_respond:
+                        self.bot.custom.show_choice_to_respond = False
+                        await ctx.send("Reasoning as to why not to respond disabled.", delete_after=5)
+                    else:
+                        self.bot.custom.show_choice_to_respond = True
+                        await ctx.send("Reasoning as to why not to respond enabled.", delete_after=5)
 
         #delete the sent message
         await ctx.message.delete(delay=5)

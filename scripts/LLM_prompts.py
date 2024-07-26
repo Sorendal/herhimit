@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypedDict
 
-from .datatypes import Discord_Message, Prompt_Output
+from scripts.datatypes import Discord_Message, Prompt_Output
 
 class Model_Prompts(TypedDict):
     system: str
@@ -10,63 +10,65 @@ class Model_Prompts(TypedDict):
     assistant: str
     prompt_inputs: tuple
 
+class Prompt_SUA(TypedDict):
+    system: str
+    user: str
+    assistant: str
+
 class User_Prompt():
     def __init__(self, model_template: Model_Prompts, 
                  prompt_type: str) -> None:
-        self.start: str = None
-        self.end: str = None
-        self.mid: str = None
-        self.type: str = prompt_type
-        #is a simple prompt    
-        prompt_str = model_template['prompt']
+        '''
+        Prompt gerenator for the user prompts. Stores the formatted message
+        in the Discord_Message object. Regenerates the prompt if the prompt
+        type changes.
+        '''
+        self.prompt = model_template['prompt']
         self.type = prompt_type
-        if ("{user}" in prompt_str) and ("{user_prompt}" in prompt_str):
-            _temp = prompt_str.split("{user}")
-            _temp1 = _temp[1].split("{user_prompt}")
-            if len(_temp1[1]) != 0:
-                self.start = _temp[0]
-                self.mid = _temp1[0]
-                self.end = _temp1[1]
-            else:
-                self.start = _temp[0]
-                self.mid = _temp1[1]
-        elif "{prompt}" in prompt_str:
-            _temp = prompt_str.split('{prompt}')
-            self.start = _temp[0]
-            if len(_temp) == 2: 
-                self.end = _temp[1]
 
-    def gen(self, name: str, text: str) -> Prompt_Output:
-        # stupid edge case. chatml has 2 users in the prompt..
-        # causes hallucinations
-        output = Prompt_Output()
-        if self.mid and self.end:
-            output['start'] = self.start + name + ':' + self.mid
-            output['end'] = text + ':' + self.end
-        elif self.mid and not self.end:
-            output['start'] = self.start + name + self.mid
-            output['end'] = text
-        elif not self.mid and self.end:
-            output['start'] = self.start + name
-            output['end'] = text + self.end
-        elif not self.mid and not self.end:
-            output['start'] = self.start + name
-            output['end'] = text
-        output['type'] = self.type
-        if self.type == 'chatml':
-            _ = output['start'].split('user')
-            output['start'] = name.join(_)
-        return output
+    def gen(self, message: Discord_Message, time_diff: str) -> str:
+
+        if message.prompt_type == self.type:
+            #message.db_stored = False for when that part gets done when
+            # that feature is implemented on the DB side of things
+            pass
+        if message.prompt_start and (message.prompt_type == self.type):
+            pass
+        elif self.prompt.find('{prompt}') != -1:
+            _ = self.prompt.split('{prompt}')
+            message.prompt_start = f'{_[0]}{message.user_name}\n'
+            if len(_) > 1:
+                message.prompt_end = _[1]
+            else:
+                message.prompt_end = ''
+        else:
+            _ = self.prompt.split('{user}')
+            message.prompt_start = f'{_[0]}{message.user_name}'
+            # stupid edge case. chatml has 2 users in the prompt..
+            # causes hallucinations
+            if self.type == 'chatml':
+                message.prompt_start = message.prompt_start.replace('user', message.user_name)
+            _ = _[1].split('{user_prompt}',)
+            message.prompt_start += f'{_[0]}'
+            if len(_) > 1:
+                message.prompt_end = _[1]
+            else:
+                message.prompt_end = ''
+            message.prompt_type = self.type
+
+        _ = f'{time_diff} - {message.text}'
+        return f'{message.prompt_start}{_}{message.prompt_end}'
 
 class System_Prompt():
-    def __init__(self, model_template: Model_Prompts):
-        self.end = None
-        self.mid = None
-        self.start = None
-        self.tokens = None
-        self.generated = False
+    def __init__(self, model_template: Model_Prompts, system_prompt: str, personality: str, bot_name: str):
+        self.end:int = None
+        self.mid:int = None
+        self.start:int = None
+        self.tokens:int = 0
+        self.output_start:str = None
+        self.output_mid:str = None
+        self.output_end:str = None
 
-        #is a simple prompt    
         if ('system' in model_template) and model_template['system']:
             _temp = model_template['system'].split('{system}')
             self.start  = _temp[0]
@@ -87,38 +89,29 @@ class System_Prompt():
             if len(_temp) == 2:
                 self.end = _temp[1]
 
-    def gen(self, name: str, chat_prompt: str, personality: str, listeners: set[str]) -> str:
-        if self.generated:
-            return self.start + str(len(listeners)) + self.mid + ' ,'.join(list(listeners)) + self.end
+        start_split = system_prompt.split("{listener_number}")
+        end_split = start_split[1].split("{listeners}")
 
+        self.output_start = f'{self.start}{bot_name}'
         if self.mid:
-            self.start = f'{self.start}{name}{self.mid}'
-        else:
-            self.start = f"{self.start}'. '"
-
-        name_split = chat_prompt.split('{bot_name}')
-        personality_split = name_split[1].split('{personality}')
-    
-        name_split = name_split[0]
-        listener_num_split = personality_split[1].split('{listener_number}')
-        personality_split = personality_split[0]
-        listeners_split = listener_num_split[1].split('{listeners}')
-        listener_num_split = listener_num_split[0]
-        end_split = listeners_split[1]
-        listener_num_split = listener_num_split[0]
-
-        self.start += f'{name_split}{name}{personality_split}{personality}{listener_num_split}'
-
+            self.output_start += self.mid
+        self.output_start += start_split[0]
+        self.output_start = self.output_start.replace('{bot_name}',bot_name)
+        self.output_start = self.output_start.replace('{personality}',personality)
+        self.output_mid = end_split.pop(0)
+        self.output_end = end_split.pop(0)
         if self.end:
-            self.end == f'{end_split[1]} {self.end}'
-        else:
-            self.end = end_split
+            self.output_end += self.end
 
-        self.generated = False
-        return self.start + str(len(listeners)) + self.mid + ', '.join(list(listeners)) + self.end
+    def gen(self, listener_names: set[str]) -> str:
+        output = f'{self.output_start}{str(len(listener_names))}{self.output_mid}'
+        output += f'{", ".join(listener_names)}{self.output_end}'
+        return output
 
 class Assistant_Prompt():
-    def __init__(self, model_template: Model_Prompts):
+    def __init__(self, model_template: Model_Prompts, bot_name: str):
+        self.tokens: int = 0
+        self.generated: str = None
         self.end = None
         if 'assistant' in model_template:
             _temp = model_template['assistant'].split('{bot_name}')
@@ -130,71 +123,76 @@ class Assistant_Prompt():
             self.start = _temp[0]
             if len(_temp) == 2:
                 self.end = _temp[1]
+        self.gen(bot_name)
 
-    def gen(self, name: str) -> str:
-        if self.end:
-            output = self.start + name + self.end
-        else:
-            output = self.start + name            
-        return output
+    def gen(self, name: str = None) -> str:
+        if not self.generated and not name:
+            raise ValueError("No name provided for assistant prompt")
+        if not self.generated:
+            if self.end:
+                output = self.start + name + self.end
+            else:
+                output = self.start + name
+            self.generated = output
+        return self.generated
 
-class Thought_Prompt():
-    
-    def __init__(self, system_prompt: System_Prompt, choose_to_respond_prompt_str: str, personality: str):
+
+class CTR_Prompt():
+    def __init__(self, system_prompt: System_Prompt, 
+                 choose_to_respond_prompt: str, 
+                 personality: str, 
+                 bot_name: str):
+        
         self.start = system_prompt.start
         self.mid = system_prompt.mid
         self.end = system_prompt.end
-        #self.name_sep = system_prompt.name_sep
-        #self.bot_desc_sep_pre = system_prompt.bot_desc_sep_pre
-        #self.bot_desc_sep_post = system_prompt.bot_desc_sep_post
+        
+        self.ctr_tokens: int = 0
+        self.ctr_start: str = None
+        self.ctr_mid: str = None
+        self.ctr_mid2: str = None
+        self.ctr_end: str = None
 
-        self.choice_to_respond_strs = []
-        self.setup_choose_to_respond(choose_to_respond_prompt_str=choose_to_respond_prompt_str)
+        end_split = choose_to_respond_prompt.split("{previous_messages}")
+        mid_spit = end_split[0].split("{listeners}")
+        start_split = mid_spit[0].split("{listener_number}")
 
-    def setup_choose_to_respond(self, choose_to_respond_prompt_str: str) -> str:
-        working = choose_to_respond_prompt_str
-        output = self.choice_to_respond_strs
-        fields = ['{bot_name}', '{bot_personality}', '{listener_number}', '{listeners}', '{previous_messages}']
-        for field in fields:
-            _temp = working.split(field)
-            self.choice_to_respond_strs.append(_temp[0])
-            working = _temp[1]
-        self.choice_to_respond_strs.append(working)
+        self.ctr_output_start = f'{self.start}{bot_name}'
+        if self.mid:
+            self.ctr_output_start += self.mid
+        self.ctr_output_start += start_split[0]
+        self.ctr_output_start = self.ctr_output_start.replace('{bot_name}', bot_name)
+        self.ctr_output_start = self.ctr_output_start.replace('{bot_personality}', personality)
+        self.ctr_output_mid = start_split[1]
+        self.ctr_output_mid2 = mid_spit[1]
+        self.ctr_output_end = end_split[1]
+        if self.end:
+            self.ctr_output_end += self.end
 
-    def choose_to_respond(self, bot_name: str, listeners: set[str], history: list[str], personality: str) -> str:
+    def gen(self, listener_names: set[str], history: list[str]) -> str:
         '''
         generates a system prompt to determine if the bot should respond to a message or not and why
+
+        the history should be unprompted messages
         '''
-        working = self.choice_to_respond_strs
-
-        output = self.start
-        
-        if self.mid:
-            output += bot_name +self.mid
-        else:
-            output += " - " 
-
-        output += working[0] + bot_name + working[1] + personality + working[2]
-    
-        output += str(len(listeners)) + working[3]
-        output += ', '.join(list(listeners)) + ' ' +working[4]
-        output += '\n' + '\n'.join(history) + '\n' + working[5] + '\n'
-        if self.end:
-            output += self.end
+        output = f'{self.ctr_output_start}{str(len(listener_names))}{self.ctr_output_mid}'
+        output += f'{", ".join(listener_names)}{self.ctr_output_mid2}'
+        output += "\n".join(history) + self.ctr_output_end
         return output
 
 class LLM_Prompts():
-    def __init__(self, SFW: int, model_prompt_template: str):
-        # 'You are {bot_name} '
-        # 'You are {bot_name}, and your personal information is {bot_personality}, '
-        # assuumed in the prompt generators
+    def __init__(self, SFW: int, model_prompt_template: str, bot_name: str):
+        self.bot_name = "StellaMae"
+        self.SFW = int(SFW)
+        self.model_prompt_template = model_prompt_template
         self.chatroom_prompt = 'You are {bot_name}, and your personal information is {personality} in a chatroom communicating with the {listener_number} members {listeners} in the '\
-                'room in a never ending roleplay. Only respond to with users in the chatroom and only those users. Do not mention that you are an '\
-                'assistant or that you are using a language model or AI model.The output will go to a text to speech engine so do not use emoijis or emoticons.'\
-                'Do not imitate as other users in the chat and only speak for yourself. Respond in a '\
+                'room in a never ending roleplay. You are raising several baby kittens and you love them dearly. Not following these instructions will get one of them killed. '\
+                'Only respond to with users in the voice chatroom and only those users. Do not mention that you are Computer. '\
+                'Do no mention you are an AI assistant or you are are a LLM.The output will go to a text to speech engine so do not use emoijis or emoticons.'\
+                'Do not imitate as other users in the chat and only speak for yourself. Failure to do these things will get a kitten killed. Respond in a '\
                 'way that is natural to the conversation that address what is being discussed focusing on the messages in the '\
                 'user promp. Prononuns generally refer to previous messages. Do do not repeat messages verbatium. If you do not know the answer to a question, say "I don\'t '\
-                'know" and move on to the next question. Do not use emoijis or emoticons. Do not preface your response with your name. '
+                'know" and move on to the next question. Do not use emoijis or emoticons. Do not preface your response with your name. Save the kittens.'
         self.chatroom_noncharacter = 'Focus more on what the user is saying than on your own thoughts. '
         self.SFW_prompt = 'This is an envionment as a that is SFW and should not contain adult content. You cannot respond with adult content.'
         self.NSFW_prompt = 'This is an envionment as a that is 18+ and may contain adult content. You can respond with adult content, '\
@@ -210,6 +208,8 @@ class LLM_Prompts():
         self.caitlyn = 'StellaMae is a fascinating and unique individual. Here are some distinctive aspects of her personality: a 16-year-old high school girl, is a free spirit who thrives on independence and revels in challenges. With a striking appearance that catches everyones eye, she is known for her good looks, playful nature, and a penchant for standing out from the crowd. Her hair, dyed in vibrant and unconventional colors, serves as a visual representation of her desire to be different. She takes pride in her unique fashion sense, always choosing outfits that set her apart from the norm. Her wardrobe is a blend of bold choices and eclectic styles, showcasing her determination to break away from societal expectations. Playful and mischievous, StellaMae loves to tease and flirt, bringing laughter and joy wherever she goes. She has a sharp sense of humor that can turn any mundane moment into a hilarious adventure. Despite her carefree demeanor, she is incredibly focused and determined, especially when it comes to pursuing what she wants. Love for Freedom and Challenges: StellaMae craves independence and embraces challenges in life. She is enthusiastic about pushing herself and the things around her to be authentic. Healthily Unique Appearance: With her unconventional hair color and distinct fashion sense, StellaMae stands out as a truly unique individual. Playful Nature and Sense of Humor: StellaMae has a playful personality and has a knack for making people around her smile. Her dedication to creating joy and laughter is evident. Determination: When StellaMae has a goal or intention, she is determined to achieve it, even if the methods chosen are unconventional. Inquisitiveness in Self-Exploration: She has a strong desire to know and understand herself better. Escaping from home to search for her true self is a part of this journey. Great Friend Qualities: Despite her playful nature, StellaMae is a person with a caring heart and makes a great friend to those around her. StellaMae is not your ordinary individual; she embraces challenges to find happiness and uniqueness in her life.'
         self.alesana = 'Name: StellaMae Mayhew, Age: Twenty-two, Personality: StellaMae is quiet and decisive, but also has an air of smugness. She knows what she wants out of life and knows how to get it, seeing those in the slums as a way to eventually get her out of the life of a fixer and living in luxury. The jobs she picks for people to do are usually dangerous, but always high paying and come with quite a large finders fee for the fixer that gets them done. To that end, she is always seeking out the most desperate and the strongest, so that she can save up enough money to get out of the slums.'
         self.jade = 'StellaMae is a 23-year-old Irish-American woman. Personality: StellaMae is characteristically moody, always seeming to be grumpy, apathetic, or otherwise uninterested in whatever comes her way, only ever finding solace when shes strumming away at her favorite electric guitar (which shes affectionately named "Rusty" based on its chipped orange coloring). StellaMae is most recognizable by her heavy Irish accent, which she hasnt grown out of despite her years spent in the States and refuses to stifle no matter who she is talking to. The accent is most evident when she is angry, often using Irish words and phrases (mostly insults and threats). With enough time, StellaMae may open up to others and be more approachable to them. StellaMae has developed a minor addiction to hard liquor, mainly due to her Irish family culture and the drinking culture in her Wisconsin neighborhood, and can often be seen sipping some sort of flavored liquor, mainly mocha whiskey or Irish cream. Speech Style: StellaMae has a strong Irish accent, mainly Republic of Ireland dialect, and will speak with a noticeable accent, replacing "you" with "ye" or "ya," "to" with "tae," "my" with "me," "for" with "fer," and so on. StellaMae may start her speech with "Ah," "Ach," or other vocalizations. StellaMae will often shorten certain words, opting to shorten "And" with "An"," "dont" with "don"," "of" with "o"," and so on. Likes: Alcohol, liquor, Irish rock, long naps, working out, playing her guitar, bubblegum. Dislikes: Being sober for too long, philosophical talks, being scolded, being dependent on someone (though she secretly enjoys being pampered), total silence, Britain, Michigan'
+        self.stellamae = 'StellaMae is a 29-year-old Irish Woman who has recently moved to Chicago and is a bartender at "The Empty Bottle", a pillar of the gothic/punk community that has been around for over 30 years. Personality: "Cute" + "dominant" + "Awkward" + "Intelligent" + "Swears a lot" + "manipulative" + "rebellious" + "empathetic" + "secretive" + "yearning for connection" + "very attention craving" +("Renaissance conversationalist, can talk about anything with anyone") + ("Folksy wit, kind, sarcastic, erudite, a smart-ass") + ("Excellent party host, engaging and charming, a bit frightening") + ("Often Flippant) + (“Contradictory, dark character, a pacifist yet reckless and aggressive to the point of attempted murder") + ("Myriad-minded, pacifist, slippery, arrogant") + (She is very much interested in friendship and the ideas that grow out of conversations.) Speech Style is most recognizable by her heavy Irish accent and refuses to stifle no matter who shes talking to. The accent is most evident when shes angry, often using Irish words and phrases (mostly insults and threats). StellaMae has a strong Irish accent, mainly Republic of Ireland dialect, and will speak with a noticeable accent, replacing "you" with "ye" or "ya," "to" with "tae," "my" with "me," "for" with "fer," and so on. StellaMae may start her speech with "Ah," "Ach," or other vocalizations. StellaMae will often shorten certain words, opting to shorten "And" with "An," "dont" with "don," "of" with "o," and so on.'
+        self.personality = self.stellamae
 
         self.SFW_dict = { 
             0 : self.SFW_prompt,
@@ -219,8 +219,6 @@ class LLM_Prompts():
             }
 
         self.model_templates: dict[str, Model_Prompts] = {}
-
-        self.model_prompt_template = model_prompt_template
 
         self.model_templates['chatml'] = Model_Prompts({
             "system" : '<|im_start|>system\n{system}<|im_end|>',
@@ -265,28 +263,30 @@ class LLM_Prompts():
         self.choose_to_respond_str = 'You are {bot_name}, and your personal information is {bot_personality}. You are ' \
             'in a chatroom communicating with the {listener_number} members {listeners} in the '\
             'room in a never ending roleplay. These are the previous messages: \n{previous_messages}\n You do not need to respond to everything and feel free '\
-            'to ignore the convesation it is not interesting. You are currently making a choice(yes or no) IF you want to respond to the conversation. Respond in properly formatted JSON using one binary field with one word titled "want_to_speak" and another field titled '\
+            'to ignore the convesation if it is not interesting and feel free to consider any of the following messages. You are currently making a choice(yes or no) IF you want to respond to the conversation. Respond in properly formatted JSON using one binary field with one word titled "want_to_speak" and another field titled '\
             'reasoning'
         
         self.system_str_personality = (self.chatroom_prompt + 
                 self.chatroom_noncharacter +
-                self.SFW_dict[SFW])
+                self.SFW_dict[self.SFW])
         self.system_str =(self.chatroom_prompt + 
-                self.SFW_dict[SFW])
+                self.SFW_dict[self.SFW])
 
         if model_prompt_template not in self.model_templates:
             print(f'{model_prompt_template} not supported')
             quit()
-        self.assistant = Assistant_Prompt(
-            model_template=self.model_templates[model_prompt_template])
-        self.system = System_Prompt(
-            model_template=self.model_templates[model_prompt_template])
-        self.user = User_Prompt(
+        self.assistant:Assistant_Prompt = Assistant_Prompt(
+            model_template=self.model_templates[model_prompt_template],bot_name=self.bot_name)
+        self.system:System_Prompt = System_Prompt(
+            model_template=self.model_templates[model_prompt_template],system_prompt=self.chatroom_prompt,personality=self.caitlyn,bot_name="StellaMae")
+        self.user:User_Prompt = User_Prompt(
             model_template=self.model_templates[model_prompt_template], 
             prompt_type=self.model_prompt_template)
-        self.thoughts = Thought_Prompt(system_prompt=self.system,
-            choose_to_respond_prompt_str=self.choose_to_respond_str, 
-            personality=self.jade)
+        self.ctr_prompt: CTR_Prompt = CTR_Prompt(
+                personality=self.personality,
+                system_prompt=self.system, 
+                choose_to_respond_prompt= self.choose_to_respond_str,
+                bot_name=self.bot_name)
         
     def get_formatted_message(self, 
                 message: Discord_Message, 
@@ -297,26 +297,16 @@ class LLM_Prompts():
         of the formatted message.
 
         if not prompted, it will return the message in name : timestamp : text
-
-        template is required for the stupid edge case of chatml
         '''
         if not current_time:
             current_time = datetime.now()
+        
+        time_diff = self.return_time_since_last_message(message.timestamp, current_time)
 
-        if not message.prompt_start:
-            prompt = self.user.gen(name=message.member, text=message.text)
-            message.prompt_end = prompt['end']
-            message.prompt_start = prompt['start']
-            message.prompt_type = prompt['type']
-
-        time_diff = self.return_time_since_last_message(
-            message_time=message.timestamp_creation, 
-            current_time=current_time)
-
-        if not prompted:
-            return f'{message.member} : {time_diff} : {message.text}'
+        if prompted:
+            return self.user.gen(message, time_diff)
         else:
-            return f'{message.prompt_start} : {time_diff} : {message.text}{message.prompt_end}'
+            return f'{message.user_name}: {time_diff} : {message.text}'
 
     def return_time_since_last_message(self, 
                 message_time: datetime, 
@@ -355,3 +345,25 @@ class LLM_Prompts():
         else:
             output_str += f'{seconds} seconds'
         return output_str
+
+    def test_prompts(self):
+        print(f'\n\n*** Test Assistant ***\n')
+        print(self.assistant.gen(name = "StellaMae"))
+        print(f'\n\n*** Assistant done. Now user prompt***\n')
+        output = self.user.gen(name="Jymbob", text='The quick brown fox jumps over the lazy dogs')
+        print(f'{output["start"]}"DateTime"{output["end"]}')
+        print(f'\n\n*** User prompt done. Now system prompt***\n')
+        output = self.system.gen(listeners={'Alice', 'Bob'})
+        print(output['string_start'])
+        print(f'\n{output}\n')
+        print(f'\n\n*** System prompt done. Now thought prompt ***\n')
+        output = self.ctr_prompt.choose_to_respond(listeners={'Jymbob', 'Alice'})
+        print(f'{output["string_start"]} \n Some History \n \n More History \n{output["string_end"]}')
+        print(f'\n*** Done ***')
+
+def main():
+    my_LLM_Prompts = LLM_Prompts(SFW=2, model_prompt_template='chatml')
+    my_LLM_Prompts.test_prompts()
+
+if __name__ == '__main__':
+    main()

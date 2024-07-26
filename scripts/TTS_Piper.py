@@ -9,7 +9,7 @@ import logging, array
 import wyoming.client as wyClient
 import wyoming.tts as wyTTS
 
-from utils.datatypes import TTS_Audio
+from scripts.datatypes import TTS_Audio
 
 logger = logging.getLogger(__name__)
 '''

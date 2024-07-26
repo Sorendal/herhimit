@@ -6,11 +6,16 @@ choice_bin - a method that returns a True or False value based on the prompt
     it allows the model to choose to do an action from a prompt based on the 
     context of the conversation. The current setup uses a prompt to choose if 
     to respond in a conversation.
+
+aiohttp session closure is responsibilty of the cog to watch the session_last
+and close it 30 seconds after last use.
 '''
-import json, requests, logging, asyncio
+import json, requests, logging
+from time import perf_counter
 import aiohttp
 
-from .datatypes import Discord_Message, positive_responses, negative_responses, RResponse
+from scripts.datatypes import CTR_Reasoning
+from scripts.LLM_prompts import Prompt_SUA
 
 logger = logging.getLogger(__name__)
 
@@ -21,145 +26,148 @@ servers_openai_api = ['openai', 'text-gen-webui']
 servers_selectable_models = ['ollama', 'text-gen-webui']
 
 class LLM_Interface():
-    def __init__ (self, llm_uri: str, llm_model: 
-                  str, server_type: str, 
-                  temperature: float = 0.7, 
-                  max_response_tokens: int = 200, 
-                  context_length: int = 16768):
-
-        self.llm_uri = llm_uri
-        self.llm_server_type = server_type
+    def __init__ (self, config: dict):
+        self.llm_uri = f'http://{config["LLM_host"]}:{int(config["LLM_port"])}'
+        self.llm_server_type = config['LLM_server_type']
         self.llm_model_list: list[str] = self.get_model_list()
-        self.llm_model:str = self.set_model(llm_model)
-        self.stop_generation: bool = False
-        self.context_length: int = context_length
-        #self.llm_client = ollama.AsyncClient(self.llm_uri)
-        
-        self.session: aiohttp.ClientSession = aiohttp.ClientSession()
-        self.session_count: int = 0
+        self.llm_model:str = self.set_model(config['LLM_model'])
+        self.temperature: float = float(config['LLM_temperature'])
 
-        self.data_get_tokens= {
+        self.token_chat_max_response = int(config['LLM_token_response'])
+        self.token_thought_max_response = self.token_chat_max_response // 2
+
+        self.session: aiohttp.ClientSession = aiohttp.ClientSession()
+        self.session_last = 0.0
+
+        self.stop_generation: float = False
+
+        self.request_data = {
             'model':self.llm_model,
             'prompt':'',
             'stream':False,
             'raw': False,
             'format':'json',
-            "options" : {"num_predict": 1}
-            }
-
-        self.data_thoughts = {
-            'model':self.llm_model,
-            'stream':False,
-            'format':'json',
-            'context': None,
-            'raw': False,
             "options" : {
                 "num_predict": 100,
-                "temperature": temperature}
-            }
-
-        self.data_stream = {
-            'model':self.llm_model,
-            'stream':True,
-#            'format':'',
-            'context': None,
-            'raw': True,
-            "options" : {
-                "num_predict": max_response_tokens,
-                "temperature": temperature
+                "temperature": self.temperature
                 }
             }
-        
-    def session_start(self):
-        self.session_count += 1
 
-    async def session_end(self):
-        self.session_count -= 1
-        #if self.session_count == 0:
-        #    await asyncio.sleep(5)
-        #    if self.session_count == 0:
-        #        await self.session.close()
-                
     async def get_num_tokens(self, prompt: str) -> int:
         '''
         Get the number of tokens in a string. Set to 1 
         token prediction to avoid wasting resources.
         '''
+        self.session_last = perf_counter()
+
+        request_data = self.request_data.copy()
+        request_data['options'] = self.request_data['options'].copy()
+        request_data['prompt'] = prompt
+        request_data["options"]["num_predict"] = 1
+
         output_json = ''
-        self.data_get_tokens['prompt'] = prompt
-        self.session_start()
-        async with self.session.post(f'{self.llm_uri}/api/generate', json=(self.data_get_tokens)) as response:
+
+        async with self.session.post(f'{self.llm_uri}/api/generate', json=request_data) as response:
             if response.status == 200:
                 async for chunk in response.content.iter_any():
                     output_json += chunk.decode('utf-8')
             else:
-                print(f'Error {response.status}: {await response.text()}')
+                print(f'Error: {response.status}')
         output_dict = json.loads(output_json)
-        await self.session_end()
-        return output_dict['prompt_eval_count']
+        output = 0
+        try:
+            output = int(output_dict['prompt_eval_count'])
+        except KeyError as e:
+            print(e, output_dict)
+        return int(output_dict['prompt_eval_count'])
 
-    async def choice_bin(self, ctr_system_prompt: str, 
-                    messages: str = None, 
-                    raw: bool = True) -> RResponse:
+        async with self.session.post(
+                        f'{self.llm_uri}/api/generate', 
+                        json=(request_data)) as response:
+            if response.status == 200:
+                async for chunk in response.content.iter_any():
+                    output_json += chunk.decode('utf-8')
+            else:
+                logger.info(f'Error {response.status}: {await response.text()}')
+        output_dict = json.loads(output_json)
+        return int(output_dict['prompt_eval_count'])
+
+    async def generate(self, prompts: Prompt_SUA, output_class, 
+                raw: bool = True, temp: float = 0.7, not_json: bool = False) -> any:
         '''
-        JSON request to the LLM to have the bot make a binary choice. Originally  
-        designed to have the bot choose to respond to the conversation, but a different
-        prompt would allow for different choices.
-        The resoning dictionary is used to provide context for the decision.
-            choice - if it choose to respond or not
-            reasoning - why it chose that option... sometimes it responds with garbage...
+        Generate a non streaming response from the LLM server. 
+
+        The 2nd parameter is the class of the output object.
         '''
-        self.session_start()
+        request_data = self.request_data.copy()
+        request_data['options'] = self.request_data['options'].copy()
+        self.session_last = perf_counter()
+
         response = ''
+
         if raw:
-            self.data_thoughts['raw'] = True
-            self.data_thoughts['prompt']=  ctr_system_prompt + '\n' + messages
-            if 'system'in self.data_thoughts.keys():
-                self.data_thoughts.pop('system')
+            request_data['raw'] = True
+            request_data['prompt']=  f'{prompts["system"]}\n{prompts["user"]}\n{prompts["assistant"]}'
         else:
-            self.data_thoughts['raw'] = False
-            self.data_thoughts['prompt']= '\n' + messages
-            self.data_thoughts['system']=ctr_system_prompt
+            request_data['raw'] = False
+            request_data['system']= prompts['system']
+            request_data['prompt']= prompts['user']
+            request_data['assistant'] = prompts['assistant']
+        request_data['stream'] = False
+        if not_json:
+            request_data['output'] = ''
+        else:
+            request_data['output'] = 'json'
+        request_data["options"]["temperature"] = temp
 
         output_json = ''
                 
-        async with self.session.post(f'{self.llm_uri}/api/generate', json=self.data_thoughts) as response:
+        async with self.session.post(f'{self.llm_uri}/api/generate', json=request_data) as response:
             if response.status == 200:
                 async for chunk in response.content.iter_any():
                     output_json += chunk.decode('utf-8')
             else:
                 print(f'Error: {response.status}')
 
-        rresponse = RResponse(response_data=output_json)
+        return output_class(output_json)
 
-        await self.session_end()
-        return rresponse
-
-    async def stream(self, user:str, system: str, assistant: str, raw: bool = True):#, system: str):
+    async def stream(self, prompts: Prompt_SUA, temp: float = .7 ,raw: bool = True):
         '''
         Simple streaming client for the LLM API. It uses raw mode to override whatever the
         llm server is doing to the prompts
         '''
-        self.session_start()
-        if raw:
-            self.data_stream['raw'] = True
-            self.data_stream['prompt']=  system + '\n' + user + '\n' + assistant
-            if 'system'in self.data_thoughts.keys():
-                self.data_stream.pop('system')
-            if 'assistant'in self.data_thoughts.keys():
-                self.data_stream.pop('assistant')
-        else:
-            self.data_stream['raw'] = False
-            self.data_stream['prompt']= '\n' + user
-            self.data_stream['system']= system
-            self.data_stream['assistant'] = assistant
+        self.session_last = perf_counter()
+        request_data = self.request_data.copy()
+        request_data['options'] = self.request_data['options'].copy()
 
-        #async with self.session.post(f'{self.llm_uri}/api/generate', json=self.data_thoughts) as response:
-        async with self.session.post(f'{self.llm_uri}/api/generate', json=self.data_stream) as response:
-            if response.status == 200:
+        print(f'{prompts["system"]}\n{prompts["user"]}\n{prompts["assistant"]}')
+
+        
+
+        if raw:
+            request_data['raw'] = True
+            request_data['prompt']=  f'{prompts["system"]}\n{prompts["user"]}\n{prompts["assistant"]}'
+        else:
+            request_data['raw'] = False
+            request_data['system']= prompts['system']
+            request_data['prompt']= prompts['user']
+            request_data['assistant'] = prompts['assistant']
+        request_data['stream'] = True
+        request_data['output'] = 'json'
+
+        request_data["options"]["temperature"] = temp
+        request_data["options"]["num_predict"] = self.token_thought_max_response
+
+        async with self.session.post(f'{self.llm_uri}/api/chat', json=self.request_data) as response:
+            if not response.status == 200:
+                raise Exception(f'Error: {response.status}')
+            else:
                 async for chunk in response.content.iter_any():
+                    print(chunk)
                     try:
-                        yield json.loads(chunk.decode('utf-8', errors='ignore'))['response']
+                        output_chunk = json.loads(chunk.decode('utf-8', errors='ignore'))['response']
+                        print(output_chunk, end="", flush=True)
+                        yield output_chunk
                     except Exception as e:
                         _ = chunk.decode('utf-8')
                         # sometimes chunks are concatinated
@@ -174,13 +182,11 @@ class LLM_Interface():
                                         continue
                                     yield json.loads(c)['response']
                                 except Exception as e1:
-                                    print(f'Error note quite handled correctly json decode: {c}\n {e1}')
+                                    logger.info(f'Error note quite handled correctly json decode: {c}\n\n {e1}\n')
                         # check to see if we care
                         elif not (_.find('"done"') - _.find('"response"')) == len('"response":""","'):
-                            print(f'Error json decode: {chunk}\n {e}')
+                            logger.info(f'Error json decode: {chunk}\n {e}')
         
-        await self.session_end()
-
     def get_model_list(self) -> list:
         '''
         Get the list of models from the LLM API

@@ -1,22 +1,20 @@
 import io, array, logging
 from datetime import datetime
 from typing import TypedDict, NotRequired
+from dataclasses import dataclass, field
 
 from wyoming import tts as wyTTS
-from .utils import strip_non_alphanum
+from scripts.utils import strip_non_alphanum
 
 logger = logging.getLogger(__name__)
-# for the DB cog so the queues can
-#   lint properly
-#   length can be inspected
 
 positive_responses = ('yes', '1', 'true')
 negative_responses = ('no', '0', 'false')
 
 class Prompt_Output(TypedDict):
-    start: str
-    end: str
-    type: NotRequired[str]
+    string_start: str
+    string_end: str
+    tokens: int
 
 class DB_InOut(TypedDict):
     member_id: int
@@ -30,37 +28,40 @@ class TTS_Audio(TypedDict):
     width: int
     channels: int
 
+@dataclass
 class Discord_Message():
-    def __init__(self, member: str, member_id: int, 
-            listeners: set[int], listener_names: set[str], *args, **kwargs) -> None:
-        self.member: str = member
-        self.member_id: int = member_id
-        self.listeners: set[str] = listeners
-        self.listener_names: set[str] = listener_names
-        if 'text' in kwargs:
-            self.text = kwargs['text']
-        else:
-            self.text: str = ''
-        self.text_llm_corrected: str = None
-        self.text_user_interrupt: str = None
-        self.sentences: list[str] = None
-        self.message_id: int = None
-        self.timestamp_Audio_Start: datetime = None
-        self.timestamp_Audio_End: datetime = None
-        self.timestamp_STT: datetime = None
-        self.timestamp_LLM: datetime = None
-        self.timestamp_TTS_start: datetime = None
-        self.timestamp_TTS_end: datetime = None
-        self.timestamp_creation: datetime = None
-        self.reponse_message_id: int = None
-        self.stored_in_db: bool = False
-        self.discord_text_message_id: int = None # -1 if restored message from db
-        self.discord_retry: int = 0
+    '''
+    Basic message in the bot.
 
-        self.prompt_tokens: int = 0
-        self.prompt_start: int = None
-        self.prompt_end: int = None
-        self.prompt_type: str = None
+    the first set of data is what is stored long term
+    '''
+    user_name: str
+    user_id: int
+    listener_ids: set[int] = field(default_factory=set)
+    listener_names: set[str] = field(default_factory=set)
+    text: str = None
+    text_llm_corrected: str = None
+    text_user_interrupt: str = None
+    timestamp: datetime = None
+    prompt_tokens: int = 0
+    prompt_start: str = None
+    prompt_end: str = None
+    prompt_type: str = None
+    db_stored: bool = False
+    db_id: int = None #used for prompt regen
+    
+    # the following data is temp data
+    sentences: list[str] = field(default_factory=list)
+    message_id: int = None
+    timestamp_Audio_Start: datetime = None
+    timestamp_Audio_End: datetime = None
+    timestamp_STT: datetime = None
+    timestamp_LLM: datetime = None
+    timestamp_TTS_start: datetime = None
+    timestamp_TTS_end: datetime = None
+    reponse_message_id: int = None
+    discord_text_message_id: int = None # -1 if restored message from db
+    discord_text_retry: int = 0
 
 class TTS_Message(TypedDict):
     text: str
@@ -70,10 +71,13 @@ class TTS_Message(TypedDict):
     alt_port: int
     disc_message: Discord_Message
 
-class RResponse():
+class CTR_Reasoning():
+    '''
+    the response:
+
+    acts as bool and a str
+    '''
     def __init__(self, response_data: str):
-        self.positive_responses = positive_responses
-        self.negative_responses = negative_responses
         self.response_data: dict = response_data
         self.reasoning: str = None
         self.choice: bool = None
@@ -85,7 +89,7 @@ class RResponse():
         choice_working = strip_non_alphanum(choice_working)
         self.reasoning = strip_non_alphanum(reasoning_working)
 
-        if choice_working.lower() in self.positive_responses:
+        if choice_working.lower() in positive_responses:
             self.choice = True
         else:
             self.choice = False
@@ -95,6 +99,15 @@ class RResponse():
             logger.info(f"Response not set {self.response_data}")
             return False
         return self.choice
+    
+    def __str__(self) -> str:
+        if self.choice == None or self.reasoning == None:
+            logger.info(f"Response not set {self.response_data}")
+            return ''
+        elif not self.reasoning:
+            logger.info(f"Reasoning not set {self.response_data}")
+            return f'{self.choice}'
+        return f"{self.choice} - {self.reasoning}"
 
 class Speaking_Interrupt():
     def __init__(self, num_sentences: int, 
@@ -115,7 +128,8 @@ class Cog_User_Info():
                 global_name: str,
                 display_name: str,
                 bot: bool,
-                timestamp_creation: datetime):
+                timestamp_creation: datetime,
+                last_DB_InOut: bool):
         self.member_id: int = member_id
         self.name: str = name
         self.global_name: str = global_name

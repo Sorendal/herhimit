@@ -43,6 +43,9 @@ Event Listeners
         called when the bot joins the voice channel. Checks if each user
         is in the DB, then logs an activity timestamp. Used during
         bot startup
+
+    todo : Discord_Message.db_id and db_stored - for saving regenerated 
+        prompts if the format changes
 '''
 import logging
 from datetime import datetime
@@ -52,7 +55,7 @@ from discord.ext import commands, tasks
 
 from scripts.DB_SQL import SQL_Interface_Base
 from scripts.discord_ext import Commands_Bot
-from utils.datatypes import Discord_Message, DB_InOut, Cog_User_Info
+from scripts.datatypes import DB_InOut, Cog_User_Info
 
 logger = logging.getLogger(__name__)
 
@@ -60,23 +63,22 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
     def __init__(self, bot: Commands_Bot) -> None:
         self.bot:Commands_Bot = bot
         SQL_Interface_Base.__init__(self)
-        self.message_waiting_for_token_count = []
-        self.queues = self.bot.___custom.queues
+        self.queues = self.bot.custom.queues
         self.set_config()
         self.db_connected: bool = True
         self.db_connected_expected: bool = self.db_connected
 
     def set_config(self):
-        self.host = self.bot.___custom.config['sql_db_host']
-        self.port = self.bot.___custom.config['sql_db_port']
-        self.user = self.bot.___custom.config['sql_db_user']
-        self.password = self.bot.___custom.config['sql_db_password']
-        self.database = self.bot.___custom.config['sql_db_database']
-        self.server_type = self.bot.___custom.config['sql_db_type']
-        self.sqlite_filename = self.bot.___custom.config['sql_db_sqlite_file']
+        self.host = self.bot.custom.config['sql_db_host']
+        self.port = self.bot.custom.config['sql_db_port']
+        self.user = self.bot.custom.config['sql_db_user']
+        self.password = self.bot.custom.config['sql_db_password']
+        self.database = self.bot.custom.config['sql_db_database']
+        self.server_type = self.bot.custom.config['sql_db_type']
+        self.sqlite_filename = self.bot.custom.config['sql_db_sqlite_file']
         self.engine = self.get_engine()
         self.factory = self.get_session_factory()
-        self.member_info: dict[int, Cog_User_Info] = self.bot.___custom.member_info
+        self.member_info: dict[int, Cog_User_Info] = self.bot.custom.member_info
 
     @tasks.loop(seconds=10)
     async def DB_Monitor(self):
@@ -85,19 +87,19 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
             await self.db_connect(switch_state=self.db_connected)
             self.db_connected_expected = self.db_connected
 
-        if self.db_connected and not self.bot.___custom.check_voice_idle(idle_time=0):
+        if self.db_connected and not self.bot.custom.voice_busy_count(idle_time=0):
             # disconnect dbs
             await self.db_connect(switch_state=False)
             self.db_connected_expected = self.db_connected
 
-        if self.bot.___custom.check_voice_idle(idle_time=300): # 5 minutes
+        if self.bot.custom.voice_busy_count(idle_time=300): # 5 minutes
             # connect dbs if there are messages to process need to check if 
             # a person is idle in voice chat
             only_active = True
-            for item in self.bot.___custom.queues.db_loginout:
+            for item in self.bot.custom.queues.db_loginout:
                 if item['out_time']:
                     only_active = False
-            if self.bot.___custom.queues.db_message and only_active:
+            if self.bot.custom.queues.db_message and only_active:
                 await self.db_connect(switch_state=True)
             else:
                 await self.db_connect(switch_state=False)
@@ -112,7 +114,7 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
 
             # process login/logout queue
             process_list = []
-            for record in self.bot.___custom.queues.db_loginout:
+            for record in self.bot.custom.queues.db_loginout:
                 if 'db_commit' in record:
                     process_list.append(record)
             if process_list:
@@ -122,7 +124,7 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
 
             # process messages queue
             await self.record_messages(disc_messages=self.queues.db_message)
-            for record in self.bot.___custom.queues.db_message:
+            for record in self.bot.custom.queues.db_message:
                 if record.stored_in_db:
                     process_list.append(record)
             if process_list:
@@ -134,7 +136,7 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
         allows the database connection to be turned on and off
         first checks db_always_connected setting
         '''
-        if self.bot.___custom.db_always_connected:
+        if self.bot.custom.db_always_connected:
             return
         if switch_state and not self.db_connected:
             self.engine = self.get_engine()
@@ -210,13 +212,13 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
             await self.user_login_q(member.id)
             if self.db_connected:
                 await self.get_member_info(member_id=member.id)
-        for member in self.bot.___custom.voice_channel.members:
+        for member in self.bot.custom.voice_channel.members:
             logger.info(f'Member {member.name} and db is {self.db_connected}')
             if member.bot  and self.db_connected:
-                message_history = await self.get_message_history(member_id=member.id)
+                message_history = await self.get_message_history(user_id=member.id)
                 if len(message_history) == None:
                     return
-                self.bot.dispatch('message_history', member_id=member.id, 
+                self.bot.dispatch('message_history', user_id=member.id, 
                     message_history= message_history)
 
     @commands.Cog.listener('on_connect')
@@ -237,13 +239,13 @@ class SQL_Interface(commands.Cog, SQL_Interface_Base):
 
     @commands.Cog.listener('on_voice_state_update')
     async def on_voice_state_update(self, member: Member, before: VoiceState, after: VoiceState):
-        if before.channel == self.bot.___custom.voice_channel:
+        if before.channel == self.bot.custom.voice_channel:
             await self.user_logout_q(member_id=member.id)
-        if after.channel == self.bot.___custom.voice_channel:
+        if after.channel == self.bot.custom.voice_channel:
             await self.user_login_q(member_id=member.id)
 
     async def cleanup(self):
-        for member in self.bot.___custom.voice_channel.members:
+        for member in self.bot.custom.voice_channel.members:
             await self.user_logout_q(member_id=member.id)
         await self.db_connect(switch_state=True)
         if self.queues.db_loginout:
