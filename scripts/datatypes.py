@@ -1,6 +1,6 @@
-import io, array, logging
+import io, array, logging, json
 from datetime import datetime
-from typing import TypedDict, NotRequired
+from typing import TypedDict, NotRequired, Any
 from dataclasses import dataclass, field
 
 from wyoming import tts as wyTTS
@@ -15,18 +15,27 @@ class Prompt_Output(TypedDict):
     string_start: str
     string_end: str
     tokens: int
+    prompt_type: str
 
-class DB_InOut(TypedDict):
-    member_id: int
-    in_time: datetime
-    out_time: datetime
-    db_commit: NotRequired[bool]
     
 class TTS_Audio(TypedDict):
     audio: array.array
     rate: int
     width: int
     channels: int
+'''
+class Personal_Info
+
+Occupation: What they do for a living.
+Hobbies and Interests: Activities they enjoy in their free time.
+Family: Basic information about family members and relationships.
+Background: Where they grew up or have lived.
+Education: Where they went to school or their level of education.
+Favorite Things: Preferences in music, movies, books, food, etc.
+Personality Traits: General characteristics such as being funny, kind, introverted, etc.
+Current Events in Life: Major life events like recent travels, upcoming plans, or personal milestones.
+Values and Beliefs: Core values, religious beliefs, or political views.
+'''
 
 @dataclass
 class Discord_Message():
@@ -37,19 +46,24 @@ class Discord_Message():
     '''
     user_name: str
     user_id: int
+    bot_id: str
+    bot_name:str
     listener_ids: set[int] = field(default_factory=set)
     listener_names: set[str] = field(default_factory=set)
     text: str = None
     text_llm_corrected: str = None
     text_user_interrupt: str = None
     timestamp: datetime = None
-    prompt_tokens: int = 0
-    prompt_start: str = None
-    prompt_end: str = None
+    stored_in_db: bool|int = False
+    tokens: int = None
     prompt_type: str = None
-    db_stored: bool = False
-    db_id: int = None #used for prompt regen
-    
+    info: dict[str, Any] = field(default_factory=dict)
+
+    # first step is to pass it thought the 1st LLM to check for coherency 
+    # and correct any errors and ask if it needs assistance.
+    text_coherency_check: bool = False
+    text_coherency_check_needs_review: bool = False
+    #bot_thoughts: dict[] = field(default_factory=dict)
     # the following data is temp data
     sentences: list[str] = field(default_factory=list)
     message_id: int = None
@@ -71,18 +85,49 @@ class TTS_Message(TypedDict):
     alt_port: int
     disc_message: Discord_Message
 
-class CTR_Reasoning():
+class Binary_Reasoning():
     '''
-    the response:
+    This is a wrapper class for self.llm.generate with a question you want to have the 
+    LLM to use along with a question you want a yes/no answer to. It will return a bool 
+    and a reasoning string. 
+    
+    Some LLMs do not respond with proper json formatting, so the exception handling brute
+    forces it.
 
-    acts as bool and a str
+    The choice of string for the question matters as the LLM will focus on that.
+    My testing scripts simulate two people discussing favorite dog breeds (Shih Tzu and 
+    Great Dane), at the time the word was choice, and it responded Great Dane instead of 
+    as yes/no answer.
+
+    The resulting object will act as a bool(decision) and a string(reason).
     '''
-    def __init__(self, response_data: str):
-        self.response_data: dict = response_data
+    def __init__(self, raw_response: Any, question: str = 'want_to_speak'):
+#        self.response_data: dict = response_data
+        self.response_data: Any = raw_response
         self.reasoning: str = None
         self.choice: bool = None
+        
+        response_dict = ''
+        try:
+            response_dict:dict = json.loads(self.response_data)
+        except Exception as e:
+            print('Error parsing JSON:', e, self.response_data)
+            quit()
+        if 'response' in response_dict.keys():
+            r:dict = json.loads(response_dict['response'])
+            if (question and 'reasoning') in r.keys():
+                if str(r[question]).lower() in positive_responses:
+                    self.choice = True
+                else:
+                    self.choice = False
+                self.reasoning = strip_non_alphanum(r['reasoning'])
+                self.response_data = r
+                return
+        print(self.response_data)        
+        quit()
+        ''' crufty crap I might need
         working_substr = response_data[response_data.find('"response"')+len('"response"'):response_data.rfind('"done"')]
-        choice_working = working_substr[working_substr.find('want_to_speak')+len('want_to_speak'):
+        choice_working = working_substr[working_substr.find(question)+len(question):
                                         working_substr.find('reasoning')]
         reasoning_working = working_substr[working_substr.find('reasoning')+len('reasoning'):]
 
@@ -93,6 +138,7 @@ class CTR_Reasoning():
             self.choice = True
         else:
             self.choice = False
+        '''
 
     def __bool__(self):
         if self.choice == None:
@@ -108,38 +154,85 @@ class CTR_Reasoning():
             logger.info(f"Reasoning not set {self.response_data}")
             return f'{self.choice}'
         return f"{self.choice} - {self.reasoning}"
+    
+class corrected_text(TypedDict):
+    """The corrected text and the original text as inferred by the LLM.
+    STT word error rates are still above 6% in perfect conditions, and 
+    they will never be perfect. """
+    corrected: str
+    original: str    
 
-class Speaking_Interrupt():
-    def __init__(self, num_sentences: int, 
-                 members: set[int], 
-                 member_names: set[str]):
-        self.num_sentences: int = num_sentences
-        self.members: set[int] = members
-        self.member_names: set[str] = member_names
+class info_table(TypedDict):
+    """ Just easier to deal with the json dump while working this out
+    instead of setting up a sql tables"""
+    corrected_text: dict[int, corrected_text]
+
+class Speaking_Interrupt(TypedDict):
+        num_sentences: int
+        user_id: int
+        user_name: str
 
 class Audio_Message():
     def __init__(self, audio_data: io.BytesIO, message: Discord_Message):
         self.audio_data: io.BytesIO = audio_data
         self.message: Discord_Message = message
 
-class Cog_User_Info():
-    def __init__(self, member_id: int,
-                name: str,
-                global_name: str,
-                display_name: str,
-                bot: bool,
-                timestamp_creation: datetime,
-                last_DB_InOut: bool):
-        self.member_id: int = member_id
-        self.name: str = name
-        self.global_name: str = global_name
-        self.display_name: str = display_name
-        self.bot: bool = bot
-        self.timestamp_creation: datetime = timestamp_creation
-        self.checked_against_db: bool = False
-        self.last_DB_InOut: DB_InOut = None
-        self.history_recalled: bool = False
+class Prompt_SUA(TypedDict):
+    system: str
+    system_b: NotRequired[str]
+    system_e: NotRequired[str]
+    user: str
+    user_b: NotRequired[str]
+    user_e: NotRequired[str]
+    assistant: NotRequired[str]
 
+class Prompt_Split(TypedDict):
+    begin: NotRequired[str]
+    middle: NotRequired[str]
+    end: NotRequired[str]
+    tokens: NotRequired[int]
+
+class db_in_out(TypedDict):
+    user_id: NotRequired[int]
+    bot_id: NotRequired[str]
+    in_time: datetime
+    out_time: datetime
+    db_commit: NotRequired[bool]
+
+@dataclass
+class db_client():
+    user_id: int
+    name: str
+    bot_uid: str = None #This is a string 
+    global_name: str = ''
+    display_name: str = ''
+    timestamp: datetime = None
+    checked_against_db: bool = False
+    last_DB_InOut: db_in_out | None = None
+    history_recalled: bool = False
+    info: dict = field(default_factory=dict)
+    voice: str = None
+    speaker: int = None
+    personality: str = None
+    prompt_type: str = None
+    prompts: dict[str, Prompt_Split] = field(default_factory=dict)
+    knowledge_user: dict = field(default_factory=dict)
+    knowledge_bot: dict = field(default_factory=dict)
+    opinion_user: dict = field(default_factory=dict)
+    opinion_bot: dict = field(default_factory=dict)
+
+    def get_tokens(self, prompt_name: str):
+        if prompt_name in self.prompts:
+            return self.prompts[prompt_name]['tokens']
+        else:
+            raise ValueError(f"Prompt name '{prompt_name}' not found.")
+        
+    def set_tokens(self, prompt_name: str, tokens: int):
+        if prompt_name in self.prompts:
+            self.prompts[prompt_name]['tokens'] = tokens
+        else:
+            raise ValueError(f"Prompt name '{prompt_name}' not found.")
+    
 Halluicanation_Sentences = (
     'thank you', 
     'bye-bye', 

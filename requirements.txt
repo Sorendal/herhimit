@@ -4,8 +4,5 @@ asyncmy
 wyoming
 numpy
 librosa
-langchain_core
-langchain_community
-transformers
 samplerate
 aiosqlite

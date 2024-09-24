@@ -57,7 +57,7 @@ Event listeners -
 commands - none
 
 '''
-import logging
+import logging, asyncio
 from datetime import datetime
 from time import perf_counter
 
@@ -109,13 +109,16 @@ class Bot_Manager(commands.Cog, Bot_LLM):
             self.llm.stop_generation = False
 
         # close the aiohttp session if inactive
-        if (perf_counter() - self.llm.session_last) < 2:
-            if not self.llm.session.closed:
-                await self.llm.session.close()
+        #if (perf_counter() - self.llm.session_last) < 2:
+        #    if not self.llm.session.closed:
+        #        await self.llm.session.close()
 
         # check if the messages have been responded to in self.queue.llm and remove them
-        while (self.queues.llm and self.queues.llm[0].reponse_message_id):
-            self.queues.llm.popleft()
+        if self.queues.llm != 0:
+            process_list = self.queues.llm.copy()
+            for item in process_list:
+                if item.reponse_message_id:
+                    self.queues.llm.remove(item)
         
         # check voice idle and process messages
         if (len(self.queues.llm) > 0):
@@ -123,21 +126,8 @@ class Bot_Manager(commands.Cog, Bot_LLM):
             for item in self.bot.custom.queues.llm:
                 process_list.append(item)
             await self.process_user_messages(process_list)
-        return
-        idle_result = self.bot.custom.voice_busy_count(
-                    idle_time=self.speaker_pause_time, 
-                    quick_num_members=1)
-        if idle_result == 2 and (len(self.queues.llm) > 0):
-            result = await self.process_user_messages(self.bot.custom.queues.llm.copy())
-        elif idle_result == 1 and (len(self.queues.llm) > 0) and self.wants_to_respond:
-            result = await self.process_user_messages(self.queues.llm.copy())
-        elif (len(self.queues.llm) > 0):
-            process_list = []
-            for item in self.bot.custom.queues.llm:
-                process_list.append(item)
-                #await self.choose_to_respond()
-                
 
+                
     async def choose_to_respond(self):
         if self.choosing_to_respond_in_progress:
             return
@@ -165,17 +155,15 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         response_message = Discord_Message(
                 user_name= self.bot_name,
                 user_id= self.bot_id,
-                listener_names = None,
-                listener_ids = None,
                 timestamp_Audio_End= messages[0].timestamp_Audio_End,
             )
         
         async for response in self.wmh_stream_sentences(
                     messages=messages, 
-                    response=response_message, 
-                    display_history=self.display_history,
-                    assistant_prompt=self.prompts.assistant,
-                    system_prompt=self.prompts.system):
+                    bot_response_mesg=response_message,
+                    bot_info=self.prompts.bot_info,
+                    display_history=self.display_history
+                    ):
             if self.bot.custom.tts_enable:
                 self.queues.tts.append(TTS_Message({
                     'text': response, 
@@ -213,10 +201,20 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         disc_message.text = ' '.join(interrupt_list)
         return disc_message
 
-    @commands.Cog.listener('on_message_history')
-    async def on_message_history(self, message_history: dict[int, Discord_Message]):
-        for key, message in message_history.items():
-            self.store_message(message, prepend=True)
+    async def get_prompt_tokens(self):
+        await asyncio.sleep(3)
+        text = self.prompts.gen_prompt_chat(self.prompts.bot_info, {'Alice', 'Bob'})
+        num_tokens = await self.llm.get_num_tokens(prompt=text)
+        self.prompts.bot_info.set_tokens(prompt_name="CHAT",tokens=num_tokens)
+        print(num_tokens)
+        
+        text = self.prompts.gen_prompt_ctr(bot_info=self.prompts.bot_info, listeners={'Alice', 'Bob'}, history= '')
+        num_tokens = await self.llm.get_num_tokens(prompt=text)
+        self.prompts.bot_info.set_tokens(prompt_name="CTR",tokens = num_tokens)
+        print(num_tokens)
+
+        self.llm.assistant_tokens = await self.llm.get_num_tokens(self.llm.prompt_assistant)
+        print(self.llm.assistant_tokens)
 
     @commands.Cog.listener('on_speaking_interrupt')
     async def on_speaking_interrupt(self, speaking_interrupt: Speaking_Interrupt):
@@ -239,12 +237,13 @@ class Bot_Manager(commands.Cog, Bot_LLM):
         self.bot_name = self.bot.user.name
         self.botman_monitor.start()
         # delay with library load
+        self.prompts.bot_info.name = self.bot_name
+        await self.get_prompt_tokens()
         logger.info('LLM model is ready')
 
     async def cleanup(self):
         if self.botman_monitor:
             self.botman_monitor.stop()
-        await self.llm.session.close()
         pass
 
 async def setup(bot: commands.Bot):

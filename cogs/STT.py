@@ -20,7 +20,7 @@ from scripts.utils import time_diff
 
 logger = logging.getLogger(__name__)
 
-class STT_wfw(commands.Cog):
+class STT(commands.Cog):
     def __init__(self, bot: Commands_Bot):
         self.bot: Commands_Bot = bot
 
@@ -95,4 +95,4 @@ class STT_wfw(commands.Cog):
             self.STT_monitor.stop()
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(STT_wfw(bot))
+    await bot.add_cog(STT(bot))
